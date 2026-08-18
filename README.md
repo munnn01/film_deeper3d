@@ -75,19 +75,44 @@ file; no Kaggle-specific requirements file is needed.
 
 ## Training order
 
-First distill a codec-specific proxy:
+First build a deterministic codec cache. The raw pipe is checked against the
+legacy PNG path before caching, two FFmpeg workers run concurrently, and each
+source clip is stored only once as `uint8`. `train/` and `val/` have separate
+cache trees; when the dataset has no `val/`, the split is stratified and fixed by
+`--seed`.
+
+```bash
+python -u precompute_codec.py \
+  --data-root /path/to/kinetics/train \
+  --codec h264 \
+  --qps 30 35 40 45 \
+  --codec-io pipe \
+  --codec-workers 2 \
+  --output-dir precomputed_codec/h264
+```
+
+Then distill a codec-specific proxy without invoking FFmpeg in every epoch:
 
 ```bash
 python -u train_proxy.py \
-  --data-root /path/to/kinetics/train \
+  --precomputed-root precomputed_codec/h264 \
   --codec h264 \
-  --qps 30 35 40 45 50 \
+  --qps 30 35 40 45 \
   --frames 16 \
   --frame-stride 2 \
   --frame-size 128 \
   --epochs 20 \
+  --batch-size 8 \
+  --clip-grad 1.0 \
+  --scheduler-factor 0.5 \
+  --scheduler-patience 3 \
   --output-dir checkpoints/h264_proxy
 ```
+
+Every cached training batch is balanced across the four QPs. Batch sizes 8 or
+16 are recommended. Validation always evaluates the fixed cached split. The
+legacy online path remains available by replacing `--precomputed-root` with
+`--data-root`; it now uses raw pipes and two codec workers by default.
 
 Then train Video Swin Lite through the real codec and frozen proxy:
 
@@ -103,7 +128,7 @@ python -u train.py \
   --swin-window-temporal 4 \
   --swin-window-spatial 8 \
   --codec h264 \
-  --codec-qps 30 35 40 45 50 \
+  --codec-qps 30 35 40 45 \
   --frames 16 \
   --frame-stride 2 \
   --frame-size 128 \
@@ -134,6 +159,7 @@ python model_summary.py \
 - `preprocessing/swin.py`: Video Swin Lite and 3-D shifted-window attention.
 - `preprocessing/model.py`: preprocessor factory plus factorized ViT/CNN ablations.
 - `preprocessing/standard_codec.py`: FFmpeg codecs, proxy and gradient bridge.
+- `precompute_codec.py`: deterministic train/val uint8 codec cache and pipe verification.
 - `train_proxy.py`: distill the proxy from real codec outputs and measured BPP.
 - `train.py`: train only the preprocessor with rate-distortion-task loss.
 - `model_summary.py`: torchinfo summaries for preprocessor and proxy.

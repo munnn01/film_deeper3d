@@ -15,10 +15,12 @@ from __future__ import annotations
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import cv2
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -36,6 +38,27 @@ def _run_ffmpeg(command: list[str]) -> None:
         raise RuntimeError(f"FFmpeg failed: {detail}") from exc
 
 
+def _run_ffmpeg_pipe(command: list[str], payload: bytes) -> bytes:
+    try:
+        completed = subprocess.run(
+            command,
+            input=payload,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "FFmpeg was not found. Install it or pass --ffmpeg /path/to/ffmpeg."
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or b"").decode(
+            "utf-8", errors="replace"
+        ).strip()
+        raise RuntimeError(f"FFmpeg pipe failed: {detail}") from exc
+    return completed.stdout
+
+
 class StandardVideoCodec(nn.Module):
     """Non-differentiable H.264/H.265 encode/decode through FFmpeg.
 
@@ -51,6 +74,9 @@ class StandardVideoCodec(nn.Module):
         fps: float = 30.0,
         preset: str = "medium",
         ffmpeg: str = "ffmpeg",
+        io_backend: str = "pipe",
+        codec_workers: int = 2,
+        ffmpeg_threads: int = 1,
     ) -> None:
         super().__init__()
         if codec not in {"h264", "h265"}:
@@ -59,11 +85,20 @@ class StandardVideoCodec(nn.Module):
             raise ValueError("QP must be in [0, 51]")
         if fps <= 0:
             raise ValueError("fps must be positive")
+        if io_backend not in {"pipe", "png"}:
+            raise ValueError("io_backend must be 'pipe' or 'png'")
+        if codec_workers < 1:
+            raise ValueError("codec_workers must be >= 1")
+        if ffmpeg_threads < 1:
+            raise ValueError("ffmpeg_threads must be >= 1")
         self.codec = codec
         self.qp = qp
         self.fps = fps
         self.preset = preset
         self.ffmpeg = ffmpeg
+        self.io_backend = io_backend
+        self.codec_workers = int(codec_workers)
+        self.ffmpeg_threads = int(ffmpeg_threads)
 
     @property
     def encoder(self) -> str:
@@ -111,7 +146,7 @@ class StandardVideoCodec(nn.Module):
             frames.append(torch.from_numpy(rgb.copy()).permute(2, 0, 1).float().div(255.0))
         return torch.stack(frames)
 
-    def _roundtrip_one(self, clip: torch.Tensor) -> tuple[torch.Tensor, float]:
+    def _roundtrip_png(self, clip: torch.Tensor) -> tuple[torch.Tensor, float]:
         time, channels, height, width = clip.shape
         if channels != 3 or time < 1:
             raise ValueError(f"expected non-empty [T,3,H,W], got {tuple(clip.shape)}")
@@ -149,6 +184,8 @@ class StandardVideoCodec(nn.Module):
                 str(self.qp),
                 "-pix_fmt",
                 "yuv420p",
+                "-threads",
+                str(self.ffmpeg_threads),
             ]
             if self.codec == "h264":
                 command.extend(
@@ -169,6 +206,8 @@ class StandardVideoCodec(nn.Module):
                     "-y",
                     "-loglevel",
                     "error",
+                    "-threads",
+                    str(self.ffmpeg_threads),
                     "-i",
                     str(stream),
                     "-frames:v",
@@ -182,18 +221,129 @@ class StandardVideoCodec(nn.Module):
             bpp = stream.stat().st_size * 8.0 / float(time * height * width)
             return reconstructed, bpp
 
+    def _roundtrip_pipe(self, clip: torch.Tensor) -> tuple[torch.Tensor, float]:
+        time, channels, height, width = clip.shape
+        if channels != 3 or time < 1:
+            raise ValueError(f"expected non-empty [T,3,H,W], got {tuple(clip.shape)}")
+        if height % 2 or width % 2:
+            raise ValueError(
+                f"yuv420p requires even height and width, got {height}x{width}"
+            )
+
+        frames = (
+            clip.detach()
+            .float()
+            .clamp(0.0, 1.0)
+            .mul(255.0)
+            .round()
+            .to(torch.uint8)
+            .permute(0, 2, 3, 1)
+            .contiguous()
+            .cpu()
+            .numpy()
+        )
+        video_size = f"{width}x{height}"
+        keyint = max(time, 1)
+        command = [
+            self.ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-video_size",
+            video_size,
+            "-framerate",
+            str(self.fps),
+            "-i",
+            "pipe:0",
+            "-frames:v",
+            str(time),
+            "-an",
+            "-c:v",
+            self.encoder,
+            "-preset",
+            self.preset,
+            "-qp",
+            str(self.qp),
+            "-pix_fmt",
+            "yuv420p",
+            "-threads",
+            str(self.ffmpeg_threads),
+        ]
+        if self.codec == "h264":
+            command.extend(
+                ["-x264-params", f"keyint={keyint}:min-keyint={keyint}:scenecut=0"]
+            )
+        else:
+            command.extend(
+                [
+                    "-x265-params",
+                    f"log-level=error:keyint={keyint}:min-keyint={keyint}:scenecut=0",
+                ]
+            )
+        command.extend(["-f", self.format_name, "pipe:1"])
+        bitstream = _run_ffmpeg_pipe(command, frames.tobytes())
+
+        decoded = _run_ffmpeg_pipe(
+            [
+                self.ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-threads",
+                str(self.ffmpeg_threads),
+                "-f",
+                self.format_name,
+                "-i",
+                "pipe:0",
+                "-frames:v",
+                str(time),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "pipe:1",
+            ],
+            bitstream,
+        )
+        expected_bytes = time * height * width * channels
+        if len(decoded) != expected_bytes:
+            raise RuntimeError(
+                "FFmpeg returned an unexpected rawvideo size: "
+                f"expected {expected_bytes} bytes, received {len(decoded)}"
+            )
+        array = np.frombuffer(decoded, dtype=np.uint8).reshape(
+            time, height, width, channels
+        )
+        reconstructed = (
+            torch.from_numpy(array.copy()).permute(0, 3, 1, 2).float().div_(255.0)
+        )
+        bpp = len(bitstream) * 8.0 / float(time * height * width)
+        return reconstructed, bpp
+
+    def _roundtrip_one(self, clip: torch.Tensor) -> tuple[torch.Tensor, float]:
+        if self.io_backend == "pipe":
+            return self._roundtrip_pipe(clip)
+        return self._roundtrip_png(clip)
+
     def forward(self, clip: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if clip.ndim != 5 or clip.shape[2] != 3:
             raise ValueError(f"expected [B,T,3,H,W], got {tuple(clip.shape)}")
         device = clip.device
         dtype = clip.dtype
-        reconstructions: list[torch.Tensor] = []
-        rates: list[float] = []
         # FFmpeg is outside autograd by construction.
-        for sample in clip.detach().cpu():
-            reconstructed, bpp = self._roundtrip_one(sample)
-            reconstructions.append(reconstructed)
-            rates.append(bpp)
+        samples = tuple(clip.detach().cpu().unbind(0))
+        if self.codec_workers > 1 and len(samples) > 1:
+            worker_count = min(self.codec_workers, len(samples))
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                results = list(executor.map(self._roundtrip_one, samples))
+        else:
+            results = [self._roundtrip_one(sample) for sample in samples]
+        reconstructions = [result[0] for result in results]
+        rates = [result[1] for result in results]
         return (
             torch.stack(reconstructions).to(device=device, dtype=dtype),
             torch.tensor(rates, device=device, dtype=torch.float32),

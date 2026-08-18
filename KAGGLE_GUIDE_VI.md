@@ -18,6 +18,7 @@ dẫn khác, sau đó chọn **Run All**.
 DATA = "/kaggle/input/datasets/rohanmallick/kinetics-train-5per/kinetics400_5per/kinetics400_5per/train"
 PROJECT = "/kaggle/working/preprocessor_Video_Swin_Lite_proxy"
 PROXY_DIR = "/kaggle/working/checkpoints/h264_proxy"
+CACHE_DIR = "/kaggle/working/precomputed_codec/h264"
 MODEL_DIR = "/kaggle/working/checkpoints/video_swin_lite"
 EVAL_DIR = "/kaggle/working/real_codec_eval"
 VIS_DIR = "/kaggle/working/visualization"
@@ -44,26 +45,61 @@ hai script train tự tạo validation split phân tầng trong bộ nhớ.
   --device auto
 ```
 
-## Cell 4 — Distill H.264 proxy
+## Cell 4 — Pre-compute codec xác định, tách train/val
+
+Cell này chỉ chạy FFmpeg một lần cho mỗi clip/QP. Clip gốc được lưu đúng một bản
+`uint8`; reconstruction của bốn QP nằm riêng trong `train/` và `val/`. Raw pipe
+được so pixel/BPP với đường PNG cũ trước khi cache và dùng đúng 2 FFmpeg workers.
+
+```python
+!python -u "$PROJECT/precompute_codec.py" \
+  --data-root "$DATA" \
+  --codec h264 \
+  --qps 30 35 40 45 \
+  --fps 30 \
+  --preset medium \
+  --codec-io pipe \
+  --codec-workers 2 \
+  --ffmpeg-threads 1 \
+  --verify-pipe \
+  --frames 16 \
+  --frame-stride 2 \
+  --frame-size 128 \
+  --val-ratio 0.1 \
+  --seed 42 \
+  --output-dir "$CACHE_DIR"
+```
+
+Cache `uint8` gồm một clip gốc và bốn reconstruction nên có thể lớn hơn dữ liệu
+video nén. Khi quota `/kaggle/working` không đủ, thêm `--limit-train N` và
+`--limit-val M`, hoặc dùng một Kinetics subset nhỏ hơn.
+
+## Cell 5 — Distill H.264 proxy từ cache
 
 ```python
 !python -u "$PROJECT/train_proxy.py" \
-  --data-root "$DATA" \
+  --precomputed-root "$CACHE_DIR" \
   --codec h264 \
-  --qps 30 35 40 45 50 \
+  --qps 30 35 40 45 \
   --fps 30 \
   --preset medium \
   --frames 16 \
   --frame-stride 2 \
   --frame-size 128 \
   --epochs 20 \
-  --batch-size 2 \
+  --batch-size 8 \
   --workers 4 \
+  --clip-grad 1.0 \
+  --scheduler-factor 0.5 \
+  --scheduler-patience 3 \
   --amp \
   --output-dir "$PROXY_DIR"
 ```
 
-## Cell 5 — Train Video Swin Lite preprocessor
+`--batch-size 8` tạo mỗi batch gồm cân bằng cả bốn QP; có thể tăng lên 16 nếu GPU
+đủ VRAM. Checkpoint lưu cả optimizer, AMP scaler và scheduler để resume đúng.
+
+## Cell 6 — Train Video Swin Lite preprocessor
 
 ```python
 !python -u "$PROJECT/train.py" \
@@ -78,7 +114,7 @@ hai script train tự tạo validation split phân tầng trong bộ nhớ.
   --swin-window-spatial 8 \
   --max-residual 0.25 \
   --codec h264 \
-  --codec-qps 30 35 40 45 50 \
+  --codec-qps 30 35 40 45 \
   --codec-fps 30 \
   --codec-preset medium \
   --frames 16 \
@@ -92,14 +128,14 @@ hai script train tự tạo validation split phân tầng trong bộ nhớ.
   --output-dir "$MODEL_DIR"
 ```
 
-## Cell 6 — Đánh giá codec thật
+## Cell 7 — Đánh giá codec thật
 
 ```python
 !python -u "$PROJECT/evaluate_real_codec.py" \
   --checkpoint "$MODEL_DIR/best.pt" \
   --test-dir "$DATA" \
   --codecs h264 \
-  --qps 30 35 40 45 50 \
+  --qps 30 35 40 45 \
   --device cuda \
   --output-dir "$EVAL_DIR"
 ```
@@ -107,7 +143,7 @@ hai script train tự tạo validation split phân tầng trong bộ nhớ.
 Do `DATA` trỏ trực tiếp tới `train/`, cell này đánh giá toàn bộ thư mục đó. Validation
 metrics của held-out split tự động vẫn được lưu trong checkpoint khi train.
 
-## Cell 7 — Trực quan hóa
+## Cell 8 — Trực quan hóa Top-1
 
 ```python
 !python -u "$PROJECT/visualize_pipeline.py" \
@@ -120,14 +156,17 @@ metrics của held-out split tự động vẫn được lưu trong checkpoint k
   --output-dir "$VIS_DIR"
 ```
 
-## Cell 8 — Nén kết quả
+File JSON và tiêu đề ảnh/video chỉ hiển thị dự đoán và accuracy Top-1, không tạo
+danh sách Top-5.
+
+## Cell 9 — Nén kết quả
 
 ```python
 %cd /kaggle/working
 !zip -qr video_swin_lite_proxy_results.zip checkpoints real_codec_eval visualization
 ```
 
-## Cell 9 — Link tải xuống
+## Cell 10 — Link tải xuống
 
 ```python
 from IPython.display import FileLink

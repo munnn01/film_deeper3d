@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import random
 import re
 from collections import defaultdict
@@ -11,7 +12,7 @@ from pathlib import Path
 import cv2
 import torch
 from torch.nn import functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 VIDEO_SUFFIXES = {".mp4", ".avi", ".mkv", ".mov", ".webm", ".m4v"}
 
@@ -173,3 +174,123 @@ class VideoFolderDataset(Dataset[tuple[torch.Tensor, int]]):
             if replacement == index:
                 replacement = (replacement + 1) % len(self.samples)
             return self.__getitem__(replacement)
+
+
+class PrecomputedCodecDataset(
+    Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]]
+):
+    """Read deterministic uint8 clips and codec targets without invoking FFmpeg."""
+
+    def __init__(
+        self,
+        root: str | Path,
+        split: str,
+        qps: Sequence[int] | None = None,
+    ) -> None:
+        self.root = Path(root)
+        manifest_path = self.root / "manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(
+                f"precomputed manifest does not exist: {manifest_path}; "
+                "run precompute_codec.py first"
+            )
+        self.manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if split not in self.manifest.get("splits", {}):
+            raise ValueError(f"split {split!r} is not present in {manifest_path}")
+        available_qps = [int(value) for value in self.manifest["codec"]["qps"]]
+        self.qps = available_qps if qps is None else [int(value) for value in qps]
+        missing = sorted(set(self.qps).difference(available_qps))
+        if missing:
+            raise ValueError(
+                f"QPs {missing} are absent from the cache; available QPs: {available_qps}"
+            )
+        self.split = split
+        self.samples = list(self.manifest["splits"][split])
+        self.items = [
+            (sample, qp) for sample in self.samples for qp in self.qps
+        ]
+        if not self.items:
+            raise RuntimeError(f"precomputed split {split!r} is empty")
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(
+        self, index: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        sample, qp = self.items[index]
+        sample_id = sample["id"]
+        clip_payload = torch.load(
+            self.root / self.split / "clips" / f"{sample_id}.pt",
+            map_location="cpu",
+            weights_only=True,
+        )
+        target_payload = torch.load(
+            self.root / self.split / "recon" / f"qp_{qp}" / f"{sample_id}.pt",
+            map_location="cpu",
+            weights_only=True,
+        )
+        clip = clip_payload["clip"].float().div_(255.0)
+        reconstruction = target_payload["reconstruction"].float().div_(255.0)
+        bpp = torch.as_tensor(target_payload["bpp"], dtype=torch.float32)
+        return clip, reconstruction, bpp, qp
+
+
+class MixedQPBatchSampler(Sampler[list[int]]):
+    """Build deterministic batches containing a balanced mixture of cached QPs."""
+
+    def __init__(
+        self,
+        dataset: PrecomputedCodecDataset,
+        batch_size: int,
+        *,
+        seed: int = 42,
+    ) -> None:
+        if batch_size < len(dataset.qps):
+            raise ValueError(
+                f"batch_size must be >= the number of QPs ({len(dataset.qps)})"
+            )
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return (len(self.dataset) + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        generator = random.Random(self.seed + self.epoch)
+        qp_count = len(self.dataset.qps)
+        buckets = [
+            [
+                sample_index * qp_count + qp_index
+                for sample_index in range(len(self.dataset.samples))
+            ]
+            for qp_index in range(qp_count)
+        ]
+        for bucket in buckets:
+            generator.shuffle(bucket)
+        positions = [0] * qp_count
+        remaining = len(self.dataset)
+        while remaining:
+            order = list(range(qp_count))
+            generator.shuffle(order)
+            batch: list[int] = []
+            while len(batch) < self.batch_size and remaining:
+                made_progress = False
+                for qp_index in order:
+                    if len(batch) == self.batch_size:
+                        break
+                    position = positions[qp_index]
+                    if position >= len(buckets[qp_index]):
+                        continue
+                    batch.append(buckets[qp_index][position])
+                    positions[qp_index] += 1
+                    remaining -= 1
+                    made_progress = True
+                if not made_progress:
+                    break
+            yield batch

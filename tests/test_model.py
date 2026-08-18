@@ -1,7 +1,13 @@
+import json
+
 import torch
 from torch import nn
 
-from preprocessing.data import stratified_split_indices
+from preprocessing.data import (
+    MixedQPBatchSampler,
+    PrecomputedCodecDataset,
+    stratified_split_indices,
+)
 from preprocessing.model import PaperPreprocessor, VideoTransformerPreprocessor
 from preprocessing.standard_codec import ParallelStandardVideoCodec, StandardCodecProxy
 from preprocessing.swin import VideoSwinLitePreprocessor
@@ -126,3 +132,47 @@ def test_stratified_split_has_no_overlap_and_preserves_classes():
     assert len(val) == 3
     assert {samples[index][1] for index in train} == {0, 1, 2}
     assert {samples[index][1] for index in val} == {0, 1, 2}
+
+
+def test_precomputed_codec_dataset_reuses_one_uint8_source_for_all_qps(tmp_path):
+    qps = [30, 35, 40, 45]
+    manifest = {
+        "codec": {"qps": qps},
+        "splits": {"train": [{"id": "00000000", "source": "clip.mp4", "label": 3}]},
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    clip_path = tmp_path / "train" / "clips" / "00000000.pt"
+    clip_path.parent.mkdir(parents=True)
+    source = torch.randint(0, 256, (2, 3, 8, 8), dtype=torch.uint8)
+    torch.save({"clip": source}, clip_path)
+    for qp in qps:
+        target_path = tmp_path / "train" / "recon" / f"qp_{qp}" / "00000000.pt"
+        target_path.parent.mkdir(parents=True)
+        torch.save({"reconstruction": source, "bpp": torch.tensor(qp / 10)}, target_path)
+
+    dataset = PrecomputedCodecDataset(tmp_path, "train", qps)
+    assert len(dataset) == 4
+    for index, qp in enumerate(qps):
+        clip, reconstruction, bpp, returned_qp = dataset[index]
+        assert returned_qp == qp
+        torch.testing.assert_close(clip, source.float() / 255.0)
+        torch.testing.assert_close(reconstruction, clip)
+        torch.testing.assert_close(bpp, torch.tensor(qp / 10))
+
+
+def test_mixed_qp_sampler_balances_every_batch(tmp_path):
+    qps = [30, 35, 40, 45]
+    samples = [
+        {"id": f"{index:08d}", "source": f"{index}.mp4", "label": 0}
+        for index in range(4)
+    ]
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"codec": {"qps": qps}, "splits": {"train": samples}}),
+        encoding="utf-8",
+    )
+    dataset = PrecomputedCodecDataset(tmp_path, "train", qps)
+    sampler = MixedQPBatchSampler(dataset, batch_size=8, seed=7)
+    batches = list(sampler)
+    assert len(batches) == 2
+    assert sorted(index % len(qps) for index in batches[0]) == [0, 0, 1, 1, 2, 2, 3, 3]
+    assert sorted(index for batch in batches for index in batch) == list(range(len(dataset)))

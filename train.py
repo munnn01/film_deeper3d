@@ -68,8 +68,8 @@ def parse_args() -> argparse.Namespace:
         "--codec-qps",
         type=int,
         nargs="+",
-        default=[30, 35, 40, 45, 50],
-        help="standard-codec QPs sampled once per epoch",
+        default=[30, 35, 40, 45],
+        help="standard-codec QPs sampled once per training batch",
     )
     model.add_argument("--codec", choices=("h264", "h265"), default="h264")
     model.add_argument("--proxy-checkpoint", required=True)
@@ -202,6 +202,7 @@ def run_epoch(
     *,
     optimizer: Adam | None = None,
     scaler: torch.amp.GradScaler | None = None,
+    qp_rng: random.Random | None = None,
 ) -> dict[str, float]:
     training = optimizer is not None
     preprocessor.train(training)
@@ -217,6 +218,13 @@ def run_epoch(
     context = torch.enable_grad if training else torch.no_grad
     with context():
         for step, (clips, labels) in enumerate(iterator, start=1):
+            if training:
+                if qp_rng is None:
+                    raise ValueError("training requires qp_rng")
+                qp = qp_rng.choice(args.codec_qps)
+            else:
+                qp = args.codec_qps[(step - 1) % len(args.codec_qps)]
+            codec.set_qp(qp)
             clips = clips.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             losses = forward_losses(clips, labels, preprocessor, codec, analyzer, args, use_amp)
@@ -241,7 +249,9 @@ def run_epoch(
             correct5 += topk_correct(losses["logits"].detach(), labels, 5)
             examples += batch
             iterator.set_postfix(
-                loss=f"{meters['loss'].average:.4f}", bpp=f"{meters['bpp'].average:.3f}"
+                loss=f"{meters['loss'].average:.4f}",
+                bpp=f"{meters['bpp'].average:.3f}",
+                qp=qp,
             )
 
     return {
@@ -349,11 +359,12 @@ def main() -> None:
         print(f"[resume] epoch={start_epoch} best_val_loss={best_loss:.6f}")
 
     output_dir = Path(args.output_dir)
-    qp_rng = random.Random(args.seed + 17)
     for epoch in range(start_epoch, args.epochs + 1):
-        qp = qp_rng.choice(args.codec_qps)
-        codec.set_qp(qp)
-        print(f"\n[epoch {epoch}/{args.epochs}] {args.codec.upper()} QP={qp}")
+        qp_rng = random.Random(args.seed + 17 + epoch)
+        print(
+            f"\n[epoch {epoch}/{args.epochs}] {args.codec.upper()} "
+            f"mixed QPs={args.codec_qps}"
+        )
         train_metrics = run_epoch(
             train_loader,
             preprocessor,
@@ -363,6 +374,7 @@ def main() -> None:
             device,
             optimizer=optimizer,
             scaler=scaler,
+            qp_rng=qp_rng,
         )
         val_metrics = run_epoch(val_loader, preprocessor, codec, analyzer, args, device)
         scheduler.step(val_metrics["loss"])
@@ -375,7 +387,8 @@ def main() -> None:
             "optimizer": optimizer.state_dict(),
             "best_val_loss": min(best_loss, val_metrics["loss"]),
             "codec": args.codec,
-            "codec_qp": qp,
+            "codec_qp": args.codec_qps[len(args.codec_qps) // 2],
+            "codec_qps": list(args.codec_qps),
             "proxy_checkpoint": str(args.proxy_checkpoint),
             "args": vars(args),
             "train_metrics": train_metrics,

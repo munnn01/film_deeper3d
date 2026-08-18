@@ -50,15 +50,17 @@ def evenly_spaced_indices(length: int, count: int) -> list[int]:
     return np.linspace(0, length - 1, count, dtype=int).tolist()
 
 
-def top_predictions(
-    logits: torch.Tensor, categories: list[str], count: int = 5
-) -> list[dict[str, float | str]]:
+def top1_prediction(
+    logits: torch.Tensor, categories: list[str], target: int
+) -> dict[str, float | str | bool]:
     probabilities = logits.softmax(dim=1)[0]
-    values, indices = probabilities.topk(min(count, probabilities.numel()))
-    return [
-        {"label": categories[int(index)], "probability": float(value)}
-        for value, index in zip(values.cpu(), indices.cpu(), strict=True)
-    ]
+    index = int(probabilities.argmax())
+    return {
+        "label": categories[index],
+        "probability": float(probabilities[index]),
+        "correct": index == target,
+        "top1_accuracy": float(index == target),
+    }
 
 
 def clip_metrics(reference: torch.Tensor, candidate: torch.Tensor) -> dict[str, float]:
@@ -87,6 +89,7 @@ def save_comparison_figure(
     bpp: float,
     reconstruction_psnr: float,
     prediction: str,
+    top1_accuracy: float,
 ) -> None:
     preprocessor_errors = [error_map(source[index], processed[index]) for index in indices]
     codec_errors = [error_map(source[index], reconstructed[index]) for index in indices]
@@ -123,7 +126,8 @@ def save_comparison_figure(
 
     figure.suptitle(
         f"Target: {class_name} | reconstruction: {prediction} | "
-        f"{bpp:.4f} bpp | {reconstruction_psnr:.2f} dB",
+        f"Top-1 acc: {top1_accuracy:.0%} | {bpp:.4f} bpp | "
+        f"{reconstruction_psnr:.2f} dB",
         y=0.995,
     )
     # Reserve a dedicated strip outside the image grid so the colorbar never
@@ -163,6 +167,7 @@ def save_comparison_video(
     *,
     fps: float,
     bpp: float,
+    top1_accuracy: float,
 ) -> bool:
     all_errors = torch.cat(
         ((processed - source).abs().flatten(), (reconstructed - source).abs().flatten())
@@ -194,7 +199,8 @@ def save_comparison_video(
         header = np.zeros((header_height, panel.shape[1], 3), dtype=np.uint8)
         cv2.putText(
             header,
-            f"Frame {index + 1}/{source.shape[0]} | standard codec {bpp:.4f} bpp",
+            f"Frame {index + 1}/{source.shape[0]} | Top-1 acc {top1_accuracy:.0%} | "
+            f"standard codec {bpp:.4f} bpp",
             (8, 22),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
@@ -290,10 +296,14 @@ def main() -> None:
         "measured_bpp": float(bpp.float().mean()),
         "preprocessor_change": clip_metrics(source, processed),
         "reconstruction": clip_metrics(source, reconstructed),
-        "predictions": {
-            "source": top_predictions(source_logits.float(), analyzer.categories),
-            "preprocessed": top_predictions(processed_logits.float(), analyzer.categories),
-            "reconstructed": top_predictions(reconstructed_logits.float(), analyzer.categories),
+        "top1": {
+            "source": top1_prediction(source_logits.float(), analyzer.categories, label),
+            "preprocessed": top1_prediction(
+                processed_logits.float(), analyzer.categories, label
+            ),
+            "reconstructed": top1_prediction(
+                reconstructed_logits.float(), analyzer.categories, label
+            ),
         },
     }
 
@@ -312,7 +322,8 @@ def main() -> None:
         class_name=analyzer.categories[label],
         bpp=metrics["measured_bpp"],
         reconstruction_psnr=metrics["reconstruction"]["psnr_db"],
-        prediction=metrics["predictions"]["reconstructed"][0]["label"],
+        prediction=metrics["top1"]["reconstructed"]["label"],
+        top1_accuracy=metrics["top1"]["reconstructed"]["top1_accuracy"],
     )
     video_saved = args.save_video and save_comparison_video(
         video_path,
@@ -321,6 +332,7 @@ def main() -> None:
         reconstructed,
         fps=args.video_fps,
         bpp=metrics["measured_bpp"],
+        top1_accuracy=metrics["top1"]["reconstructed"]["top1_accuracy"],
     )
     metrics["outputs"] = {
         "figure": str(figure_path),

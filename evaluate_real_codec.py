@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-dir")
     parser.add_argument("--split", default="val")
     parser.add_argument("--codecs", nargs="+", choices=("h264", "h265"), default=["h264", "h265"])
-    parser.add_argument("--qps", nargs="+", type=int, default=[30, 35, 40, 45, 50])
+    parser.add_argument("--qps", nargs="+", type=int, default=[30, 35, 40, 45])
     parser.add_argument("--frames", type=int, default=16)
     parser.add_argument("--frame-stride", type=int, default=2)
     parser.add_argument("--frame-size", type=int, default=128)
