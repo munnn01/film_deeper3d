@@ -1,5 +1,6 @@
 import json
 
+import pytest
 import torch
 from torch import nn
 
@@ -82,14 +83,40 @@ def test_video_swin_lite_backpropagates_through_shifted_windows():
 
 
 def test_standard_codec_proxy_preserves_clip_shape_and_has_input_gradient():
-    proxy = StandardCodecProxy(hidden_channels=8, latent_channels=12)
-    clip = torch.rand(1, 3, 3, 17, 19, requires_grad=True)
-    reconstruction, bpp = proxy(clip, qp=35)
+    proxy = StandardCodecProxy(
+        hidden_channels=8,
+        latent_channels=12,
+        bottleneck_channels=16,
+        blocks_per_stage=1,
+        film_channels=8,
+    )
+    torch.nn.init.normal_(proxy.to_rgb.weight, std=0.01)
+    clip = torch.rand(2, 3, 3, 17, 19, requires_grad=True)
+    reconstruction, bpp = proxy(clip, qp=torch.tensor([30, 45]))
     assert reconstruction.shape == clip.shape
-    assert bpp.shape == (1,)
+    assert bpp.shape == (2,)
     (reconstruction.mean() + bpp.mean()).backward()
     assert clip.grad is not None
     assert torch.isfinite(clip.grad).all()
+    assert clip.grad.abs().sum() > 0
+    assert proxy.config["architecture"] == "film_deeper3d_v1"
+
+
+def test_film_deeper3d_rejects_legacy_shallow_checkpoint(tmp_path):
+    checkpoint = tmp_path / "legacy.pt"
+    torch.save(
+        {
+            "proxy_config": {
+                "hidden_channels": 8,
+                "latent_channels": 12,
+                "max_delta": 0.5,
+            },
+            "proxy": {},
+        },
+        checkpoint,
+    )
+    with pytest.raises(ValueError, match="retrain the proxy from scratch"):
+        StandardCodecProxy.from_checkpoint(checkpoint)
 
 
 class _FakeStandardCodec(nn.Module):
@@ -122,6 +149,27 @@ def test_parallel_codec_uses_real_forward_values_and_proxy_backward():
     (reconstruction.mean() + bpp.mean()).backward()
     assert clip.grad is not None
     assert torch.count_nonzero(clip.grad) == clip.numel()
+
+
+def test_frozen_film_deeper3d_proxy_backpropagates_to_preprocessor_input():
+    proxy = StandardCodecProxy(
+        hidden_channels=8,
+        latent_channels=12,
+        bottleneck_channels=16,
+        blocks_per_stage=1,
+        film_channels=8,
+    )
+    torch.nn.init.normal_(proxy.to_rgb.weight, std=0.01)
+    codec = ParallelStandardVideoCodec(_FakeStandardCodec(), proxy).train()
+    clip = torch.rand(2, 3, 3, 16, 16, requires_grad=True)
+    reconstruction, bpp = codec(clip)
+    torch.testing.assert_close(reconstruction, torch.full_like(clip, 0.375))
+    torch.testing.assert_close(bpp, torch.full((2,), 1.25))
+    (reconstruction.mean() + bpp.mean()).backward()
+    assert clip.grad is not None
+    assert torch.isfinite(clip.grad).all()
+    assert clip.grad.abs().sum() > 0
+    assert all(parameter.grad is None for parameter in proxy.parameters())
 
 
 def test_stratified_split_has_no_overlap_and_preserves_classes():

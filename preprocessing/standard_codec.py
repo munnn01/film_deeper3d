@@ -350,55 +350,166 @@ class StandardVideoCodec(nn.Module):
         )
 
 
+def _normalization_groups(channels: int) -> int:
+    for groups in (8, 4, 2, 1):
+        if channels % groups == 0:
+            return groups
+    return 1
+
+
+class _Residual3DBlock(nn.Module):
+    """Pre-activation residual block that preserves space and time resolution."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        groups = _normalization_groups(channels)
+        self.norm1 = nn.GroupNorm(groups, channels)
+        self.conv1 = nn.Conv3d(channels, channels, kernel_size=3, padding=1)
+        self.norm2 = nn.GroupNorm(groups, channels)
+        self.conv2 = nn.Conv3d(channels, channels, kernel_size=3, padding=1)
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        residual = value
+        value = self.conv1(F.gelu(self.norm1(value)))
+        value = self.conv2(F.gelu(self.norm2(value)))
+        return residual + value
+
+
+class _FiLM3D(nn.Module):
+    """QP-conditioned feature-wise affine modulation: gamma * x + beta."""
+
+    def __init__(self, condition_channels: int, feature_channels: int) -> None:
+        super().__init__()
+        self.feature_channels = feature_channels
+        self.affine = nn.Linear(condition_channels, feature_channels * 2)
+        nn.init.zeros_(self.affine.weight)
+        nn.init.zeros_(self.affine.bias)
+
+    def forward(self, value: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+        gamma_delta, beta = self.affine(condition).chunk(2, dim=1)
+        gamma = 1.0 + gamma_delta
+        return gamma[:, :, None, None, None] * value + beta[:, :, None, None, None]
+
+
+class _Conditional3DStage(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        condition_channels: int,
+        blocks: int,
+    ) -> None:
+        super().__init__()
+        self.film = _FiLM3D(condition_channels, channels)
+        self.blocks = nn.Sequential(
+            *[_Residual3DBlock(channels) for _ in range(blocks)]
+        )
+
+    def forward(self, value: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+        return self.blocks(self.film(value, condition))
+
+
 class StandardCodecProxy(nn.Module):
-    """Compact differentiable video network distilled from a standard codec."""
+    """FiLM-conditioned deep 3-D skip proxy distilled from a standard codec."""
+
+    ARCHITECTURE = "film_deeper3d_v1"
 
     def __init__(
         self,
         hidden_channels: int = 48,
         latent_channels: int = 64,
+        bottleneck_channels: int = 96,
+        blocks_per_stage: int = 2,
+        film_channels: int = 64,
+        qp_step_divisor: float = 12.0,
         max_delta: float = 0.5,
     ) -> None:
         super().__init__()
+        if min(hidden_channels, latent_channels, bottleneck_channels, film_channels) < 1:
+            raise ValueError("proxy channel counts must be positive")
+        if blocks_per_stage < 1:
+            raise ValueError("blocks_per_stage must be positive")
+        if qp_step_divisor <= 0:
+            raise ValueError("qp_step_divisor must be positive")
         self.hidden_channels = hidden_channels
         self.latent_channels = latent_channels
+        self.bottleneck_channels = bottleneck_channels
+        self.blocks_per_stage = blocks_per_stage
+        self.film_channels = film_channels
+        self.qp_step_divisor = qp_step_divisor
         self.max_delta = max_delta
-        self.encoder = nn.Sequential(
-            nn.Conv3d(
-                3, hidden_channels, kernel_size=(3, 5, 5), stride=(1, 2, 2), padding=(1, 2, 2)
-            ),
-            nn.GELU(),
-            nn.Conv3d(
-                hidden_channels,
-                latent_channels,
-                kernel_size=3,
-                stride=(1, 2, 2),
-                padding=1,
-            ),
-            nn.GELU(),
-        )
+
         self.qp_embedding = nn.Sequential(
-            nn.Linear(1, latent_channels), nn.GELU(), nn.Linear(latent_channels, latent_channels)
-        )
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose3d(
-                latent_channels,
-                hidden_channels,
-                kernel_size=(3, 4, 4),
-                stride=(1, 2, 2),
-                padding=(1, 1, 1),
-            ),
+            nn.Linear(1, film_channels),
             nn.GELU(),
-            nn.ConvTranspose3d(
-                hidden_channels,
-                3,
-                kernel_size=(3, 4, 4),
-                stride=(1, 2, 2),
-                padding=(1, 1, 1),
-            ),
+            nn.Linear(film_channels, film_channels),
+            nn.GELU(),
         )
+        self.stem = nn.Conv3d(
+            3,
+            hidden_channels,
+            kernel_size=(3, 5, 5),
+            stride=(1, 2, 2),
+            padding=(1, 2, 2),
+        )
+        self.encoder_high = _Conditional3DStage(
+            hidden_channels, film_channels, blocks_per_stage
+        )
+        self.down_middle = nn.Conv3d(
+            hidden_channels,
+            latent_channels,
+            kernel_size=(3, 4, 4),
+            stride=(1, 2, 2),
+            padding=(1, 1, 1),
+        )
+        self.encoder_middle = _Conditional3DStage(
+            latent_channels, film_channels, blocks_per_stage
+        )
+        self.down_bottleneck = nn.Conv3d(
+            latent_channels,
+            bottleneck_channels,
+            kernel_size=(3, 4, 4),
+            stride=(1, 2, 2),
+            padding=(1, 1, 1),
+        )
+        self.bottleneck = _Conditional3DStage(
+            bottleneck_channels, film_channels, blocks_per_stage
+        )
+
+        self.up_middle = nn.ConvTranspose3d(
+            bottleneck_channels,
+            latent_channels,
+            kernel_size=(3, 4, 4),
+            stride=(1, 2, 2),
+            padding=(1, 1, 1),
+        )
+        self.decoder_middle = _Conditional3DStage(
+            latent_channels, film_channels, blocks_per_stage
+        )
+        self.up_high = nn.ConvTranspose3d(
+            latent_channels,
+            hidden_channels,
+            kernel_size=(3, 4, 4),
+            stride=(1, 2, 2),
+            padding=(1, 1, 1),
+        )
+        self.decoder_high = _Conditional3DStage(
+            hidden_channels, film_channels, blocks_per_stage
+        )
+        self.to_rgb = nn.ConvTranspose3d(
+            hidden_channels,
+            3,
+            kernel_size=(3, 4, 4),
+            stride=(1, 2, 2),
+            padding=(1, 1, 1),
+        )
+        nn.init.zeros_(self.to_rgb.weight)
+        nn.init.zeros_(self.to_rgb.bias)
+
+        rate_features = bottleneck_channels * 4 + 1
         self.rate_head = nn.Sequential(
-            nn.Linear(latent_channels + 1, hidden_channels),
+            nn.Linear(rate_features, bottleneck_channels * 2),
+            nn.GELU(),
+            nn.Linear(bottleneck_channels * 2, hidden_channels),
             nn.GELU(),
             nn.Linear(hidden_channels, 1),
         )
@@ -406,8 +517,13 @@ class StandardCodecProxy(nn.Module):
     @property
     def config(self) -> dict[str, Any]:
         return {
+            "architecture": self.ARCHITECTURE,
             "hidden_channels": self.hidden_channels,
             "latent_channels": self.latent_channels,
+            "bottleneck_channels": self.bottleneck_channels,
+            "blocks_per_stage": self.blocks_per_stage,
+            "film_channels": self.film_channels,
+            "qp_step_divisor": self.qp_step_divisor,
             "max_delta": self.max_delta,
         }
 
@@ -430,37 +546,64 @@ class StandardCodecProxy(nn.Module):
     def _ste_round(value: torch.Tensor) -> torch.Tensor:
         return value + (value.round() - value).detach()
 
+    def _rate_statistics(self, quantized: torch.Tensor) -> torch.Tensor:
+        mean_magnitude = quantized.abs().mean(dim=(2, 3, 4))
+        spatial_variance = quantized.var(dim=(3, 4), unbiased=False).mean(dim=2)
+        smooth_sparsity = torch.exp(-quantized.abs()).mean(dim=(2, 3, 4))
+        if quantized.shape[2] > 1:
+            temporal_change = (
+                quantized[:, :, 1:] - quantized[:, :, :-1]
+            ).abs().mean(dim=(2, 3, 4))
+        else:
+            temporal_change = torch.zeros_like(mean_magnitude)
+        return torch.cat(
+            (mean_magnitude, spatial_variance, smooth_sparsity, temporal_change),
+            dim=1,
+        )
+
     def forward(
         self, clip: torch.Tensor, qp: int | float | torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if clip.ndim != 5 or clip.shape[2] != 3:
             raise ValueError(f"expected [B,T,3,H,W], got {tuple(clip.shape)}")
         batch, time, _, height, width = clip.shape
-        pad_height = (4 - height % 4) % 4
-        pad_width = (4 - width % 4) % 4
+        pad_height = (8 - height % 8) % 8
+        pad_width = (8 - width % 8) % 8
         channels_first = clip.permute(0, 2, 1, 3, 4)
         if pad_height or pad_width:
             channels_first = F.pad(
-                channels_first, (0, pad_width, 0, pad_height, 0, 0), mode="replicate"
+                channels_first,
+                (0, pad_width, 0, pad_height, 0, 0),
+                mode="replicate",
             )
 
         qp_value = self._qp_tensor(
             qp, batch, device=clip.device, dtype=clip.dtype
         )
         qp_normalized = ((qp_value - 25.5) / 25.5).unsqueeze(1)
-        latent = self.encoder(channels_first)
-        condition = self.qp_embedding(qp_normalized).view(batch, -1, 1, 1, 1)
-        latent = latent + condition
-        q_step = torch.pow(2.0, (qp_value - 32.0) / 6.0).view(batch, 1, 1, 1, 1)
-        quantized = self._ste_round(latent / q_step) * q_step
+        condition = self.qp_embedding(qp_normalized)
 
-        delta = self.max_delta * torch.tanh(self.decoder(quantized))
+        high = self.encoder_high(self.stem(channels_first), condition)
+        middle = self.encoder_middle(self.down_middle(high), condition)
+        bottleneck = self.bottleneck(self.down_bottleneck(middle), condition)
+        q_step = torch.pow(
+            2.0, (qp_value - 32.0) / self.qp_step_divisor
+        ).view(batch, 1, 1, 1, 1)
+        quantized = self._ste_round(bottleneck / q_step) * q_step
+
+        decoded_middle = self.up_middle(quantized) + middle
+        decoded_middle = self.decoder_middle(decoded_middle, condition)
+        decoded_high = self.up_high(decoded_middle) + high
+        decoded_high = self.decoder_high(decoded_high, condition)
+        delta = self.max_delta * torch.tanh(self.to_rgb(decoded_high))
         delta = delta[..., :time, :height, :width]
-        reconstruction = (channels_first[..., :height, :width] + delta).clamp(0.0, 1.0)
+        source = channels_first[..., :time, :height, :width]
+        reconstruction = (source + delta).clamp(0.0, 1.0)
         reconstruction = reconstruction.permute(0, 2, 1, 3, 4)
 
-        statistics = quantized.abs().mean(dim=(2, 3, 4))
-        rate = F.softplus(self.rate_head(torch.cat((statistics, qp_normalized), dim=1))).squeeze(1)
+        statistics = self._rate_statistics(quantized)
+        rate_features = torch.cat((statistics, qp_normalized), dim=1)
+        rate = F.softplus(self.rate_head(rate_features)).squeeze(1)
         return reconstruction, rate
 
     @classmethod
@@ -468,10 +611,16 @@ class StandardCodecProxy(nn.Module):
         cls, path: str | Path, map_location: str | torch.device = "cpu"
     ) -> StandardCodecProxy:
         checkpoint = torch.load(path, map_location=map_location, weights_only=False)
-        config = checkpoint.get("proxy_config", {}) if isinstance(checkpoint, dict) else {}
-        model = cls(**config)
         if not isinstance(checkpoint, dict):
             raise ValueError(f"unsupported proxy checkpoint: {path}")
+        config = dict(checkpoint.get("proxy_config", {}))
+        architecture = config.pop("architecture", None)
+        if architecture != cls.ARCHITECTURE:
+            raise ValueError(
+                f"proxy checkpoint architecture is {architecture or 'legacy_shallow'}, "
+                f"expected {cls.ARCHITECTURE}; retrain the proxy from scratch"
+            )
+        model = cls(**config)
         state = checkpoint.get("proxy", checkpoint.get("state_dict", checkpoint))
         model.load_state_dict(state)
         return model

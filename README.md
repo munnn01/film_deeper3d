@@ -1,4 +1,4 @@
-# Video Swin Lite preprocessing through standard video codecs
+# Video Swin Lite preprocessing with a FiLM deeper-3D codec proxy
 
 Task-aware video preprocessing with the requested pipeline kept intact:
 
@@ -30,6 +30,29 @@ bpp = proxy_bpp + (real_bpp - proxy_bpp).detach()
 Consequently, task and rate-distortion loss values correspond to the standard
 codec while gradients still reach only the preprocessor. Codec proxy and analyzer
 parameters remain frozen.
+
+## FiLM deeper-3D proxy
+
+The differentiable proxy is a compact 3-D residual encoder-decoder rather than
+the earlier two-layer Conv3D model:
+
+```text
+RGB clip + per-sample QP
+  -> spatial /2 Conv3D -> FiLM -> residual 3-D blocks ------------ skip ----+
+  -> spatial /4 Conv3D -> FiLM -> residual 3-D blocks ------ skip ----+      |
+  -> spatial /8 Conv3D -> FiLM -> residual 3-D bottleneck           |      |
+  -> softened STE quantization                                      |      |
+  -> up /4 + skip -> FiLM -> residual 3-D blocks <------------------+      |
+  -> up /2 + skip -> FiLM -> residual 3-D blocks <-------------------------+
+  -> RGB residual -> input + delta -> proxy reconstruction
+```
+
+Every FiLM layer applies `gamma(QP) * feature + beta(QP)`, so mixed-QP samples
+can change feature scale as well as bias. The three spatial scales and residual
+blocks give a receptive field larger than a 64x64 H.264 coding-tree region.
+The rate head uses mean magnitude, spatial variance, smooth sparsity and temporal
+change statistics. The proxy remains frozen during preprocessor training, but
+autograd still differentiates its output with respect to the preprocessed clip.
 
 ## Video Swin Lite preprocessor
 
@@ -103,6 +126,12 @@ python -u train_proxy.py \
   --frame-size 128 \
   --epochs 20 \
   --batch-size 8 \
+  --hidden-channels 48 \
+  --latent-channels 64 \
+  --bottleneck-channels 96 \
+  --blocks-per-stage 2 \
+  --film-channels 64 \
+  --qp-step-divisor 12 \
   --clip-grad 1.0 \
   --scheduler-factor 0.5 \
   --scheduler-patience 3 \
@@ -113,6 +142,11 @@ Every cached training batch is balanced across the four QPs. Batch sizes 8 or
 16 are recommended. Validation always evaluates the fixed cached split. The
 legacy online path remains available by replacing `--precomputed-root` with
 `--data-root`; it now uses raw pipes and two codec workers by default.
+
+The proxy architecture changed, so a shallow-proxy `last.pt` cannot be resumed.
+Start FiLM deeper-3D training at epoch 1 with a new output directory. Existing
+precomputed codec caches remain fully reusable because their real reconstruction
+and BPP targets are architecture-independent.
 
 Then train Video Swin Lite through the real codec and frozen proxy:
 

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "video-machine-preprocessing"
-version = "0.4.0"
-description = "Video Swin Lite preprocessing through standard codecs with proxy gradients"
+version = "0.5.0"
+description = "Video Swin Lite preprocessing with a FiLM deeper-3D codec proxy"
 requires-python = ">=3.10"
 dependencies = [
   "matplotlib>=3.7",

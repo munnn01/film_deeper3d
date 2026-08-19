@@ -7,8 +7,8 @@ dẫn khác, sau đó chọn **Run All**.
 
 ```python
 %cd /kaggle/working
-!git clone -q https://github.com/munnn01/preprocessor_Video_Swin_Lite_proxy.git
-%cd /kaggle/working/preprocessor_Video_Swin_Lite_proxy
+!git clone -q https://github.com/munnn01/film_deeper3d.git
+%cd /kaggle/working/film_deeper3d
 %pip install -q --no-cache-dir -r requirements.txt
 ```
 
@@ -16,8 +16,8 @@ dẫn khác, sau đó chọn **Run All**.
 
 ```python
 DATA = "/kaggle/input/datasets/rohanmallick/kinetics-train-5per/kinetics400_5per/kinetics400_5per/train"
-PROJECT = "/kaggle/working/preprocessor_Video_Swin_Lite_proxy"
-PROXY_DIR = "/kaggle/working/checkpoints/h264_proxy"
+PROJECT = "/kaggle/working/film_deeper3d"
+PROXY_DIR = "/kaggle/working/checkpoints/h264_film_deeper3d"
 CACHE_DIR = "/kaggle/working/precomputed_codec/h264"
 MODEL_DIR = "/kaggle/working/checkpoints/video_swin_lite"
 EVAL_DIR = "/kaggle/working/real_codec_eval"
@@ -89,6 +89,12 @@ video nén. Khi quota `/kaggle/working` không đủ, thêm `--limit-train N` v�
   --epochs 20 \
   --batch-size 8 \
   --workers 4 \
+  --hidden-channels 48 \
+  --latent-channels 64 \
+  --bottleneck-channels 96 \
+  --blocks-per-stage 2 \
+  --film-channels 64 \
+  --qp-step-divisor 12 \
   --clip-grad 1.0 \
   --scheduler-factor 0.5 \
   --scheduler-patience 3 \
@@ -98,6 +104,8 @@ video nén. Khi quota `/kaggle/working` không đủ, thêm `--limit-train N` v�
 
 `--batch-size 8` tạo mỗi batch gồm cân bằng cả bốn QP; có thể tăng lên 16 nếu GPU
 đủ VRAM. Checkpoint lưu cả optimizer, AMP scaler và scheduler để resume đúng.
+Proxy shallow cũ không tương thích với kiến trúc này, vì vậy phải train từ epoch 1
+với `PROXY_DIR` mới. Cache codec đã tạo trước đây vẫn dùng lại được.
 
 ## Cell 6 — Train Video Swin Lite preprocessor
 
@@ -163,7 +171,7 @@ danh sách Top-5.
 
 ```python
 %cd /kaggle/working
-!zip -qr video_swin_lite_proxy_results.zip checkpoints real_codec_eval visualization
+!zip -qr film_deeper3d_results.zip checkpoints real_codec_eval visualization
 ```
 
 ## Cell 10 — Link tải xuống
@@ -171,5 +179,5 @@ danh sách Top-5.
 ```python
 from IPython.display import FileLink
 
-FileLink("/kaggle/working/video_swin_lite_proxy_results.zip")
+FileLink("/kaggle/working/film_deeper3d_results.zip")
 ```

@@ -57,6 +57,10 @@ def parse_args() -> argparse.Namespace:
     model = parser.add_argument_group("proxy")
     model.add_argument("--hidden-channels", type=int, default=48)
     model.add_argument("--latent-channels", type=int, default=64)
+    model.add_argument("--bottleneck-channels", type=int, default=96)
+    model.add_argument("--blocks-per-stage", type=int, default=2)
+    model.add_argument("--film-channels", type=int, default=64)
+    model.add_argument("--qp-step-divisor", type=float, default=12.0)
     model.add_argument("--max-delta", type=float, default=0.5)
 
     optimization = parser.add_argument_group("optimization")
@@ -256,6 +260,10 @@ def main() -> None:
     proxy = StandardCodecProxy(
         hidden_channels=args.hidden_channels,
         latent_channels=args.latent_channels,
+        bottleneck_channels=args.bottleneck_channels,
+        blocks_per_stage=args.blocks_per_stage,
+        film_channels=args.film_channels,
+        qp_step_divisor=args.qp_step_divisor,
         max_delta=args.max_delta,
     ).to(device)
     real_codec = None
@@ -283,6 +291,25 @@ def main() -> None:
     best_loss = float("inf")
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
+        checkpoint_config = checkpoint.get("proxy_config", {})
+        checkpoint_architecture = checkpoint_config.get("architecture")
+        if checkpoint_architecture != StandardCodecProxy.ARCHITECTURE:
+            raise ValueError(
+                "--resume points to a legacy shallow proxy checkpoint. "
+                "FiLM deeper-3D changes tensor shapes, so start from epoch 1 "
+                "with a new --output-dir. The precomputed codec cache can be reused."
+            )
+        if checkpoint_config != proxy.config:
+            differences = [
+                f"{name}: checkpoint={checkpoint_config.get(name)!r}, "
+                f"CLI={proxy.config.get(name)!r}"
+                for name in sorted(set(checkpoint_config) | set(proxy.config))
+                if checkpoint_config.get(name) != proxy.config.get(name)
+            ]
+            raise ValueError(
+                "proxy architecture arguments differ from the resume checkpoint: "
+                + "; ".join(differences)
+            )
         proxy.load_state_dict(checkpoint["proxy"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         if "scheduler" in checkpoint:

@@ -53,6 +53,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--proxy-checkpoint")
     parser.add_argument("--proxy-hidden-channels", type=int, default=48)
     parser.add_argument("--proxy-latent-channels", type=int, default=64)
+    parser.add_argument("--proxy-bottleneck-channels", type=int, default=96)
+    parser.add_argument("--proxy-blocks-per-stage", type=int, default=2)
+    parser.add_argument("--proxy-film-channels", type=int, default=64)
+    parser.add_argument("--proxy-qp-step-divisor", type=float, default=12.0)
     parser.add_argument("--proxy-max-delta", type=float, default=0.5)
     parser.add_argument("--qp", type=int, default=35)
     return parser.parse_args()
@@ -106,6 +110,10 @@ def main() -> None:
             proxy = StandardCodecProxy(
                 hidden_channels=args.proxy_hidden_channels,
                 latent_channels=args.proxy_latent_channels,
+                bottleneck_channels=args.proxy_bottleneck_channels,
+                blocks_per_stage=args.proxy_blocks_per_stage,
+                film_channels=args.proxy_film_channels,
+                qp_step_divisor=args.proxy_qp_step_divisor,
                 max_delta=args.proxy_max_delta,
             )
         show("CODEC PROXY", ProxyAtFixedQP(proxy, args.qp), args, device)
