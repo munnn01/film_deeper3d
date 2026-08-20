@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 from collections import defaultdict
 from pathlib import Path
 
+import matplotlib
 import torch
 from torch.nn import functional as F
 from tqdm import tqdm
 
+matplotlib.use("Agg")
+from matplotlib import pyplot as plt
+
 from preprocessing import FrozenVideoAnalyzer, StandardVideoCodec, build_preprocessor
-from preprocessing.data import VideoFolderDataset, resolve_split
+from preprocessing.evaluation import build_evaluation_dataset, calculate_bd_rate
 from preprocessing.utils import topk_correct, write_json
 
 
@@ -22,7 +27,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root")
     parser.add_argument("--test-dir")
     parser.add_argument("--split", default="val")
-    parser.add_argument("--codecs", nargs="+", choices=("h264", "h265"), default=["h264", "h265"])
+    parser.add_argument(
+        "--val-ratio",
+        type=float,
+        help="override checkpoint validation ratio when val/ is absent",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        help="override checkpoint split seed when val/ is absent",
+    )
+    parser.add_argument(
+        "--codecs",
+        nargs="+",
+        choices=("h264", "h265"),
+        default=["h264", "h265"],
+    )
     parser.add_argument("--qps", nargs="+", type=int, default=[30, 35, 40, 45])
     parser.add_argument("--frames", type=int, default=16)
     parser.add_argument("--frame-stride", type=int, default=2)
@@ -34,6 +54,83 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output-dir", default="outputs/real_codec")
     return parser.parse_args()
+
+
+def format_bd_rate(value: float | None) -> str:
+    return "undefined" if value is None else f"{value:+.2f}%"
+
+
+def save_rate_accuracy_plot(
+    path: Path,
+    rows: list[dict[str, float | int | str]],
+    codec: str,
+    task_bd_rate: float | None,
+    psnr_bd_rate: float | None,
+) -> None:
+    colors = {"anchor": "#E45756", "preprocessed": "#4C78A8"}
+    labels = {"anchor": "Anchor", "preprocessed": "Video Swin preprocessor"}
+    figure, axes = plt.subplots(1, 3, figsize=(18, 5))
+    codec_rows = [row for row in rows if row["codec"] == codec]
+    for method in ("anchor", "preprocessed"):
+        method_rows = [row for row in codec_rows if row["method"] == method]
+        qp_rows = sorted(method_rows, key=lambda row: int(row["qp"]))
+        rate_rows = sorted(method_rows, key=lambda row: float(row["bpp"]))
+        color = colors[method]
+        axes[0].plot(
+            [row["qp"] for row in qp_rows],
+            [row["bpp"] for row in qp_rows],
+            marker="o",
+            linewidth=2,
+            color=color,
+            label=labels[method],
+        )
+        axes[1].plot(
+            [row["bpp"] for row in rate_rows],
+            [row["top1_percent"] for row in rate_rows],
+            marker="o",
+            linewidth=2,
+            color=color,
+            label=labels[method],
+        )
+        axes[2].plot(
+            [row["bpp"] for row in rate_rows],
+            [row["psnr_db"] for row in rate_rows],
+            marker="o",
+            linewidth=2,
+            color=color,
+            label=labels[method],
+        )
+        for row in rate_rows:
+            axes[1].annotate(
+                f"QP {int(row['qp'])}",
+                (float(row["bpp"]), float(row["top1_percent"])),
+                xytext=(4, 4),
+                textcoords="offset points",
+                fontsize=8,
+            )
+
+    axes[0].set(xlabel="QP", ylabel="Bitrate (BPP)", title="QP - BPP")
+    axes[1].set(
+        xlabel="Bitrate (BPP)",
+        ylabel="Top-1 accuracy (%)",
+        title="Task rate-accuracy",
+    )
+    axes[2].set(
+        xlabel="Bitrate (BPP)",
+        ylabel="PSNR (dB)",
+        title="Classical rate-distortion",
+    )
+    for axis in axes:
+        axis.grid(alpha=0.3)
+        axis.legend()
+    figure.suptitle(
+        f"{codec.upper()} | Task BD-rate: {format_bd_rate(task_bd_rate)} | "
+        f"PSNR BD-rate: {format_bd_rate(psnr_bd_rate)}",
+        fontsize=14,
+    )
+    figure.tight_layout()
+    figure.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(figure)
 
 
 def real_codec_roundtrip(
@@ -84,15 +181,18 @@ def main() -> None:
     ).to(device).eval()
     preprocessor.load_state_dict(checkpoint["preprocessor"])
 
-    test_root = Path(args.test_dir) if args.test_dir else resolve_split(args.data_root, args.split)
-    dataset = VideoFolderDataset(
-        test_root,
-        analyzer.categories,
+    dataset = build_evaluation_dataset(
+        data_root=args.data_root,
+        test_dir=args.test_dir,
+        split=args.split,
+        categories=analyzer.categories,
         frames=args.frames,
         stride=args.frame_stride,
         size=args.frame_size,
-        train=False,
         limit=args.limit,
+        val_ratio=args.val_ratio,
+        seed=args.seed,
+        saved_args=saved_args,
     )
     totals: dict[tuple[str, int, str], dict[str, float]] = defaultdict(
         lambda: {"videos": 0, "bpp": 0.0, "mse": 0.0, "top1": 0, "top5": 0}
@@ -128,6 +228,7 @@ def main() -> None:
     rows = []
     for (codec, qp, method), values in sorted(totals.items()):
         count = int(values["videos"])
+        mse = values["mse"] / count
         rows.append(
             {
                 "codec": codec,
@@ -135,8 +236,10 @@ def main() -> None:
                 "method": method,
                 "videos": count,
                 "bpp": values["bpp"] / count,
-                "mse": values["mse"] / count,
+                "mse": mse,
+                "psnr_db": -10.0 * math.log10(max(mse, 1e-12)),
                 "top1": values["top1"] / count,
+                "top1_percent": 100.0 * values["top1"] / count,
                 "top5": values["top5"] / count,
             }
         )
@@ -148,6 +251,27 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
     print(f"wrote {output / 'metrics.csv'}")
+
+    bd_rates = {}
+    for codec in args.codecs:
+        codec_rows = [row for row in rows if row["codec"] == codec]
+        task_bd_rate = calculate_bd_rate(codec_rows, "top1_percent")
+        psnr_bd_rate = calculate_bd_rate(codec_rows, "psnr_db")
+        bd_rates[codec] = {
+            "task_bd_rate_percent": task_bd_rate,
+            "psnr_bd_rate_percent": psnr_bd_rate,
+        }
+        plot_path = output / f"{codec}_top1_bpp_bd_rate.png"
+        save_rate_accuracy_plot(
+            plot_path, rows, codec, task_bd_rate, psnr_bd_rate
+        )
+        print(
+            f"[{codec}] task BD-rate={format_bd_rate(task_bd_rate)} "
+            f"PSNR BD-rate={format_bd_rate(psnr_bd_rate)}"
+        )
+        print(f"wrote {plot_path}")
+    write_json(output / "bd_rate.json", bd_rates)
+    print(f"wrote {output / 'bd_rate.json'}")
 
 
 if __name__ == "__main__":

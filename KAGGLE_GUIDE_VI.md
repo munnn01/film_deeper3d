@@ -141,15 +141,23 @@ với `PROXY_DIR` mới. Cache codec đã tạo trước đây vẫn dùng lại
 ```python
 !python -u "$PROJECT/evaluate_real_codec.py" \
   --checkpoint "$MODEL_DIR/best.pt" \
-  --test-dir "$DATA" \
+  --data-root "$DATA" \
   --codecs h264 \
   --qps 30 35 40 45 \
   --device cuda \
   --output-dir "$EVAL_DIR"
 ```
 
-Do `DATA` trỏ trực tiếp tới `train/`, cell này đánh giá toàn bộ thư mục đó. Validation
-metrics của held-out split tự động vẫn được lưu trong checkpoint khi train.
+Khi không có `val/`, script tự đọc `val_ratio` và `seed` trong checkpoint để tái
+tạo đúng validation phân tầng trong bộ nhớ; không cần tạo `EVAL_DATA`, symlink hay
+dùng cache precompute. Mặc định script đánh giá toàn bộ validation và ghi:
+
+- `metrics.csv`, `metrics.json`: BPP, MSE, PSNR, Top-1 và Top-5 theo từng QP.
+- `bd_rate.json`: Task BD-rate theo Top-1 và BD-rate chuẩn theo PSNR.
+- `h264_top1_bpp_bd_rate.png`: biểu đồ QP-BPP, BPP-Top-1 và BPP-PSNR.
+
+Chỉ thêm `--limit 200` khi cần chạy thử nhanh. Kết quả báo cáo chính thức nên bỏ
+`--limit`; giới hạn eval độc lập với `--limit-train/--limit-val` của precompute.
 
 ## Cell 8 — Trực quan hóa Top-1
 

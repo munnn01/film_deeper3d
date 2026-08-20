@@ -16,15 +16,19 @@ matplotlib.use("Agg")
 from matplotlib import pyplot as plt
 
 from preprocessing import FrozenVideoAnalyzer, StandardVideoCodec, build_preprocessor
-from preprocessing.data import VideoFolderDataset, resolve_split
+from preprocessing.evaluation import build_evaluation_dataset, dataset_sample_path
 from preprocessing.utils import write_json
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--data-root", required=True)
+    parser.add_argument("--data-root")
+    parser.add_argument("--test-dir")
     parser.add_argument("--split", default="val")
+    parser.add_argument("--val-ratio", type=float)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--limit", type=int)
     parser.add_argument("--sample-index", type=int, default=0)
     parser.add_argument("--codec", choices=("h264", "h265"))
     parser.add_argument("--codec-qp", type=int)
@@ -233,18 +237,23 @@ def main() -> None:
     codec_preset = args.codec_preset or saved_args.get("codec_preset", "medium")
 
     analyzer = FrozenVideoAnalyzer(analyzer_name).to(device).eval()
-    dataset = VideoFolderDataset(
-        resolve_split(args.data_root, args.split),
-        analyzer.categories,
+    dataset = build_evaluation_dataset(
+        data_root=args.data_root,
+        test_dir=args.test_dir,
+        split=args.split,
+        categories=analyzer.categories,
         frames=frames,
         stride=stride,
         size=size,
-        train=False,
+        limit=args.limit,
+        val_ratio=args.val_ratio,
+        seed=args.seed,
+        saved_args=saved_args,
     )
     if not 0 <= args.sample_index < len(dataset):
         raise IndexError(f"sample index {args.sample_index} is outside [0, {len(dataset) - 1}]")
     source, label = dataset[args.sample_index]
-    source_path = dataset.samples[args.sample_index][0]
+    source_path = dataset_sample_path(dataset, args.sample_index)
 
     preprocessor = build_preprocessor(
         saved_args.get("preprocessor", "cnn"),

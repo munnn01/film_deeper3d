@@ -9,6 +9,11 @@ from preprocessing.data import (
     PrecomputedCodecDataset,
     stratified_split_indices,
 )
+from preprocessing.evaluation import (
+    build_evaluation_dataset,
+    calculate_bd_rate,
+    dataset_sample_path,
+)
 from preprocessing.model import PaperPreprocessor, VideoTransformerPreprocessor
 from preprocessing.standard_codec import ParallelStandardVideoCodec, StandardCodecProxy
 from preprocessing.swin import VideoSwinLitePreprocessor
@@ -180,6 +185,55 @@ def test_stratified_split_has_no_overlap_and_preserves_classes():
     assert len(val) == 3
     assert {samples[index][1] for index in train} == {0, 1, 2}
     assert {samples[index][1] for index in val} == {0, 1, 2}
+
+
+def test_evaluation_recreates_checkpoint_validation_split_and_limit(tmp_path):
+    categories = ["class zero", "class one"]
+    for class_name in ("class_zero", "class_one"):
+        directory = tmp_path / class_name
+        directory.mkdir()
+        for index in range(5):
+            (directory / f"{index}.mp4").touch()
+
+    full = build_evaluation_dataset(
+        categories=categories,
+        data_root=tmp_path,
+        saved_args={"val_ratio": 0.2, "seed": 7},
+    )
+    limited = build_evaluation_dataset(
+        categories=categories,
+        data_root=tmp_path,
+        limit=1,
+        saved_args={"val_ratio": 0.2, "seed": 7},
+    )
+
+    assert len(full) == 2
+    assert len(limited) == 1
+    assert dataset_sample_path(limited, 0) == dataset_sample_path(full, 0)
+
+
+def test_bd_rate_reports_known_twenty_percent_saving():
+    rows = []
+    for method, scale in (("anchor", 1.0), ("preprocessed", 0.8)):
+        for quality, rate in zip((30.0, 40.0, 50.0, 60.0), (0.1, 0.2, 0.4, 0.8)):
+            rows.append(
+                {
+                    "method": method,
+                    "bpp": rate * scale,
+                    "quality": quality,
+                }
+            )
+
+    assert calculate_bd_rate(rows, "quality") == pytest.approx(-20.0, abs=1e-6)
+
+
+def test_bd_rate_is_undefined_for_flat_task_accuracy():
+    rows = [
+        {"method": method, "bpp": rate, "top1": 50.0}
+        for method in ("anchor", "preprocessed")
+        for rate in (0.1, 0.2, 0.3, 0.4)
+    ]
+    assert calculate_bd_rate(rows, "top1") is None
 
 
 def test_precomputed_codec_dataset_reuses_one_uint8_source_for_all_qps(tmp_path):

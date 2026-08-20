@@ -175,6 +175,35 @@ python -u train.py \
 If `val/` is absent, training creates a deterministic stratified validation subset
 using indices in memory. Classes containing only one video remain in training.
 
+## Real-codec evaluation
+
+Final evaluation never uses the proxy. It compares the anchor and preprocessed
+clips through the real FFmpeg codec and frozen analyzer. If `val/` is absent,
+`evaluate_real_codec.py` automatically recreates the checkpoint's stratified
+validation split in memory from its saved `val_ratio` and `seed`; no validation
+folder, symlinks or precomputed codec cache are required.
+
+```bash
+python -u evaluate_real_codec.py \
+  --checkpoint checkpoints/preprocessor/best.pt \
+  --data-root /path/to/kinetics/train \
+  --codecs h264 \
+  --qps 30 35 40 45 \
+  --device cuda \
+  --output-dir outputs/real_codec
+```
+
+The output includes `metrics.csv`, `metrics.json`, `bd_rate.json`, and one
+`<codec>_top1_bpp_bd_rate.png` plot per codec. Task BD-rate uses Top-1 as the
+quality axis; PSNR BD-rate is also reported. Negative BD-rate means bitrate
+saving at equal quality. Task BD-rate is reported as undefined when discrete
+Top-1 curves have too few distinct points or no overlapping accuracy range.
+
+Omit `--limit` for the final result. `--limit 200` is useful for a faster pilot,
+but produces noisier Top-1 and task BD-rate estimates. The limit applies only to
+evaluation videos after the deterministic split and is independent of the proxy
+precompute limits.
+
 ## Kaggle and model summary
 
 Ready-to-run Kaggle cells are in [KAGGLE_GUIDE_VI.md](KAGGLE_GUIDE_VI.md).
@@ -196,6 +225,7 @@ python model_summary.py \
 - `precompute_codec.py`: deterministic train/val uint8 codec cache and pipe verification.
 - `train_proxy.py`: distill the proxy from real codec outputs and measured BPP.
 - `train.py`: train only the preprocessor with rate-distortion-task loss.
+- `preprocessing/evaluation.py`: reproducible held-out split and BD-rate helpers.
 - `model_summary.py`: torchinfo summaries for preprocessor and proxy.
-- `evaluate_real_codec.py`: anchor/preprocessed rate-accuracy evaluation.
-- `visualize_pipeline.py`: qualitative pipeline output.
+- `evaluate_real_codec.py`: real-codec metrics, Top-1/BPP plots and BD-rate.
+- `visualize_pipeline.py`: qualitative output from the same held-out split.
