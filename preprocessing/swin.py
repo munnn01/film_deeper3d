@@ -319,11 +319,13 @@ def _round_up(value: int, multiple: int) -> int:
 
 
 class VideoSwinLitePreprocessor(nn.Module):
-    """Single-stage Video Swin that predicts a bounded RGB residual.
+    """QP-conditioned single-stage Video Swin predicting a bounded RGB residual.
 
     The temporal axis is never downsampled. Spatial patchification is reversed
     exactly by a transposed 3-D convolution. The zero-initialized reconstruction
-    head makes a newly created model an exact identity mapping.
+    head makes a newly created model an exact identity mapping. When enabled,
+    an H.264/H.265 QP embedding FiLM-modulates every Swin block and gates the
+    final residual so one model can learn different behavior at each QP.
     """
 
     def __init__(
@@ -335,6 +337,9 @@ class VideoSwinLitePreprocessor(nn.Module):
         window_size: int | Sequence[int] = (4, 8, 8),
         mlp_ratio: float = 4.0,
         max_residual: float = 0.25,
+        qp_conditioning: bool = True,
+        qp_embed_dim: int = 64,
+        default_qp: float = 35.0,
     ) -> None:
         super().__init__()
         if patch_size < 1:
@@ -345,6 +350,10 @@ class VideoSwinLitePreprocessor(nn.Module):
             raise ValueError("embed_dim must be positive and divisible by num_heads")
         if not 0.0 < max_residual <= 1.0:
             raise ValueError("max_residual must be in (0, 1]")
+        if qp_embed_dim < 1:
+            raise ValueError("qp_embed_dim must be positive")
+        if not 0.0 <= default_qp <= 51.0:
+            raise ValueError("default_qp must be in [0, 51]")
         self.patch_size = patch_size
         self.embed_dim = embed_dim
         self.depth = depth
@@ -352,6 +361,9 @@ class VideoSwinLitePreprocessor(nn.Module):
         self.window_size = _triple(window_size)
         self.mlp_ratio = mlp_ratio
         self.max_residual = max_residual
+        self.qp_conditioning = bool(qp_conditioning)
+        self.qp_embed_dim = qp_embed_dim
+        self.default_qp = float(default_qp)
 
         self.patch_embedding = nn.Conv3d(
             3,
@@ -376,6 +388,21 @@ class VideoSwinLitePreprocessor(nn.Module):
                 for index in range(depth)
             ]
         )
+        if self.qp_conditioning:
+            self.qp_embedding: nn.Module | None = nn.Sequential(
+                nn.Linear(1, qp_embed_dim),
+                nn.GELU(),
+                nn.Linear(qp_embed_dim, qp_embed_dim),
+                nn.GELU(),
+            )
+            self.qp_films = nn.ModuleList(
+                nn.Linear(qp_embed_dim, embed_dim * 2) for _ in range(depth)
+            )
+            self.qp_residual_gate: nn.Linear | None = nn.Linear(qp_embed_dim, 1)
+        else:
+            self.qp_embedding = None
+            self.qp_films = nn.ModuleList()
+            self.qp_residual_gate = None
         self.normalization = nn.LayerNorm(embed_dim)
         self.to_rgb = nn.ConvTranspose3d(
             embed_dim,
@@ -386,6 +413,11 @@ class VideoSwinLitePreprocessor(nn.Module):
         self.apply(self._initialize_transformer)
         nn.init.zeros_(self.to_rgb.weight)
         nn.init.zeros_(self.to_rgb.bias)
+        if self.qp_residual_gate is not None:
+            # sigmoid(2) ~= 0.88: start close to the configured max residual
+            # while retaining a hard [0, 1] QP-dependent gate.
+            nn.init.zeros_(self.qp_residual_gate.weight)
+            nn.init.constant_(self.qp_residual_gate.bias, 2.0)
 
     @staticmethod
     def _initialize_transformer(module: nn.Module) -> None:
@@ -397,10 +429,46 @@ class VideoSwinLitePreprocessor(nn.Module):
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)
 
-    def forward(self, clip: torch.Tensor) -> torch.Tensor:
+    def _qp_condition(
+        self,
+        qp: int | float | torch.Tensor | None,
+        batch: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        if not self.qp_conditioning:
+            return None
+        value = self.default_qp if qp is None else qp
+        qp_tensor = torch.as_tensor(value, device=device, dtype=dtype).flatten()
+        if qp_tensor.numel() == 1:
+            qp_tensor = qp_tensor.expand(batch)
+        if qp_tensor.numel() != batch:
+            raise ValueError(f"QP must be scalar or have {batch} elements")
+        if not bool(torch.isfinite(qp_tensor).all()):
+            raise ValueError("QP must contain only finite values")
+        if bool(((qp_tensor < 0) | (qp_tensor > 51)).any()):
+            raise ValueError("QP must be in [0, 51]")
+        normalized = ((qp_tensor - 25.5) / 25.5).unsqueeze(1)
+        assert self.qp_embedding is not None
+        return self.qp_embedding(normalized)
+
+    @staticmethod
+    def _apply_film(
+        features: torch.Tensor, film: nn.Linear, condition: torch.Tensor
+    ) -> torch.Tensor:
+        parameters = torch.tanh(film(condition))
+        gamma, beta = parameters.chunk(2, dim=1)
+        gamma = gamma[:, None, None, None, :]
+        beta = beta[:, None, None, None, :]
+        return features * (1.0 + gamma) + beta
+
+    def forward(
+        self, clip: torch.Tensor, qp: int | float | torch.Tensor | None = None
+    ) -> torch.Tensor:
         if clip.ndim != 5 or clip.shape[2] != 3:
             raise ValueError(f"expected [B,T,3,H,W], got {tuple(clip.shape)}")
-        _, _, _, height, width = clip.shape
+        batch, _, _, height, width = clip.shape
         pad_height = (self.patch_size - height % self.patch_size) % self.patch_size
         pad_width = (self.patch_size - width % self.patch_size) % self.patch_size
         channel_first = clip.permute(0, 2, 1, 3, 4)
@@ -415,11 +483,25 @@ class VideoSwinLitePreprocessor(nn.Module):
         features = features + self.position(features)
         features = features.permute(0, 2, 3, 4, 1)
         features = self.embedding_normalization(features)
-        for block in self.blocks:
+        condition = self._qp_condition(
+            qp,
+            batch,
+            device=features.device,
+            dtype=features.dtype,
+        )
+        for index, block in enumerate(self.blocks):
+            if condition is not None:
+                features = self._apply_film(
+                    features, self.qp_films[index], condition
+                )
             features = block(features)
         features = self.normalization(features).permute(0, 4, 1, 2, 3)
 
         residual = self.max_residual * torch.tanh(self.to_rgb(features))
+        if condition is not None:
+            assert self.qp_residual_gate is not None
+            gate = torch.sigmoid(self.qp_residual_gate(condition))
+            residual = residual * gate[:, :, None, None, None]
         residual = residual[..., :height, :width]
         source = clip.permute(0, 2, 1, 3, 4)
         output = (source + residual).clamp(0.0, 1.0)

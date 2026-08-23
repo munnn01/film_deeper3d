@@ -84,7 +84,10 @@ class PaperPreprocessor(nn.Module):
             batch * time, self.temporal_frames * channels, height, width
         )
 
-    def forward(self, clip: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, clip: torch.Tensor, qp: int | float | torch.Tensor | None = None
+    ) -> torch.Tensor:
+        del qp  # CNN ablation is intentionally not QP-conditioned.
         if clip.ndim != 5 or clip.shape[2] != 3:
             raise ValueError(f"expected [B,T,3,H,W], got {tuple(clip.shape)}")
         batch, time, _, height, width = clip.shape
@@ -187,7 +190,10 @@ class VideoTransformerPreprocessor(nn.Module):
         embedding[:, 1::2] = torch.cos(position * frequencies[: self.embed_dim // 2])
         return embedding.to(dtype=dtype)
 
-    def forward(self, clip: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, clip: torch.Tensor, qp: int | float | torch.Tensor | None = None
+    ) -> torch.Tensor:
+        del qp  # Factorized-ViT ablation is intentionally not QP-conditioned.
         if clip.ndim != 5 or clip.shape[2] != 3:
             raise ValueError(f"expected [B,T,3,H,W], got {tuple(clip.shape)}")
         batch, time, _, _, _ = clip.shape
@@ -238,6 +244,8 @@ def build_preprocessor(
     swin_depth: int = 4,
     swin_num_heads: int = 4,
     swin_window_size: tuple[int, int, int] = (4, 8, 8),
+    swin_qp_conditioning: bool = True,
+    swin_qp_embed_dim: int = 64,
     max_residual: float = 0.25,
 ) -> nn.Module:
     """Construct a preprocessor from checkpoint/CLI-friendly arguments."""
@@ -249,6 +257,8 @@ def build_preprocessor(
             depth=swin_depth,
             num_heads=swin_num_heads,
             window_size=swin_window_size,
+            qp_conditioning=swin_qp_conditioning,
+            qp_embed_dim=swin_qp_embed_dim,
             max_residual=max_residual,
         )
     if kind == "vit":

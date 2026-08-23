@@ -59,14 +59,16 @@ autograd still differentiates its output with respect to the preprocessed clip.
 `VideoSwinLitePreprocessor` is a compact dense video transformer:
 
 ```text
-BTCHW RGB video
+BTCHW RGB video + codec QP
+  -> normalized QP embedding (MLP)
   -> Conv3D spatial patch embedding, patch=(1,4,4), 3 -> 48 channels
   -> depthwise Conv3D positional encoding
   -> four alternating regular/shifted 3-D Swin blocks
+       QP FiLM: (1 + gamma(QP)) * feature + beta(QP)
        window=(4,8,8), heads=4, MLP ratio=4
   -> LayerNorm
   -> ConvTranspose3D spatial reconstruction, 48 -> RGB
-  -> tanh * 0.25
+  -> tanh * 0.25 * sigmoid(QP residual gate)
   -> input + RGB residual
 ```
 
@@ -75,6 +77,10 @@ between neighboring clips and spatial regions while avoiding global space-time
 attention. The RGB head is zero-initialized, so a new model is exactly the identity
 mapping. The earlier factorized ViT and CNN remain available as `--preprocessor vit`
 and `--preprocessor cnn` for ablation; `swin` is the default.
+QP conditioning is enabled by default for new Swin checkpoints. It lets low QPs
+suppress expensive texture without forcing high QPs to use the same residual.
+Evaluation reconstructs the QP-specific preprocessed clip before every real-codec
+operating point. Legacy checkpoints without QP parameters remain loadable.
 
 ## Objective
 
@@ -161,6 +167,8 @@ python -u train.py \
   --swin-heads 4 \
   --swin-window-temporal 4 \
   --swin-window-spatial 8 \
+  --swin-qp-conditioning \
+  --swin-qp-embed-dim 64 \
   --codec h264 \
   --codec-qps 30 35 40 45 \
   --frames 16 \

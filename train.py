@@ -62,6 +62,13 @@ def parse_args() -> argparse.Namespace:
     model.add_argument("--swin-heads", type=int, default=4)
     model.add_argument("--swin-window-temporal", type=int, default=4)
     model.add_argument("--swin-window-spatial", type=int, default=8)
+    model.add_argument(
+        "--swin-qp-conditioning",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="condition Video Swin features and residual strength on codec QP",
+    )
+    model.add_argument("--swin-qp-embed-dim", type=int, default=64)
     model.add_argument("--max-residual", type=float, default=0.25)
     model.add_argument("--analyzer", default="r3d_18")
     model.add_argument(
@@ -166,10 +173,11 @@ def forward_losses(
     analyzer: FrozenVideoAnalyzer,
     args: argparse.Namespace,
     use_amp: bool,
+    qp: int,
 ) -> dict[str, torch.Tensor]:
     device_type = clips.device.type
     with torch.autocast(device_type=device_type, dtype=torch.float16, enabled=use_amp):
-        processed = preprocessor(clips)
+        processed = preprocessor(clips, qp)
         # Forward values come from FFmpeg; the frozen proxy supplies only the
         # reconstruction/rate Jacobian needed to update the preprocessor.
         reconstructed, bpp = codec(processed)
@@ -227,7 +235,16 @@ def run_epoch(
             codec.set_qp(qp)
             clips = clips.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
-            losses = forward_losses(clips, labels, preprocessor, codec, analyzer, args, use_amp)
+            losses = forward_losses(
+                clips,
+                labels,
+                preprocessor,
+                codec,
+                analyzer,
+                args,
+                use_amp,
+                qp,
+            )
             if training:
                 scaled_loss = losses["total"] / args.accumulation_steps
                 assert scaler is not None
@@ -300,6 +317,8 @@ def main() -> None:
             args.swin_window_spatial,
             args.swin_window_spatial,
         ),
+        swin_qp_conditioning=args.swin_qp_conditioning,
+        swin_qp_embed_dim=args.swin_qp_embed_dim,
         max_residual=args.max_residual,
     ).to(device)
     proxy_checkpoint = torch.load(

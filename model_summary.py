@@ -11,6 +11,18 @@ from torchinfo import summary
 from preprocessing import StandardCodecProxy, build_preprocessor
 
 
+class PreprocessorAtFixedQP(nn.Module):
+    """Bind QP so torchinfo exercises the conditioned preprocessor path."""
+
+    def __init__(self, preprocessor: nn.Module, qp: int) -> None:
+        super().__init__()
+        self.preprocessor = preprocessor
+        self.qp = qp
+
+    def forward(self, clip: torch.Tensor) -> torch.Tensor:
+        return self.preprocessor(clip, self.qp)
+
+
 class ProxyAtFixedQP(nn.Module):
     """Bind QP so torchinfo sees a conventional one-input module."""
 
@@ -48,6 +60,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--swin-heads", type=int, default=4)
     parser.add_argument("--swin-window-temporal", type=int, default=4)
     parser.add_argument("--swin-window-spatial", type=int, default=8)
+    parser.add_argument(
+        "--swin-qp-conditioning",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--swin-qp-embed-dim", type=int, default=64)
     parser.add_argument("--max-residual", type=float, default=0.25)
 
     parser.add_argument("--proxy-checkpoint")
@@ -99,9 +117,16 @@ def main() -> None:
                 args.swin_window_spatial,
                 args.swin_window_spatial,
             ),
+            swin_qp_conditioning=args.swin_qp_conditioning,
+            swin_qp_embed_dim=args.swin_qp_embed_dim,
             max_residual=args.max_residual,
         )
-        show("PREPROCESSOR", preprocessor, args, device)
+        show(
+            "PREPROCESSOR",
+            PreprocessorAtFixedQP(preprocessor, args.qp),
+            args,
+            device,
+        )
 
     if args.model in {"proxy", "all"}:
         if args.proxy_checkpoint:

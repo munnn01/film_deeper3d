@@ -79,12 +79,53 @@ def test_video_swin_lite_backpropagates_through_shifted_windows():
     )
     torch.nn.init.normal_(model.to_rgb.weight, std=0.01)
     clip = 0.25 + 0.5 * torch.rand(1, 3, 3, 8, 8)
-    model(clip).mean().backward()
+    model(clip, qp=30).mean().backward()
     assert model.to_rgb.weight.grad is not None
     assert torch.isfinite(model.to_rgb.weight.grad).all()
     shifted_qkv_gradient = model.blocks[1].attention.qkv.weight.grad
     assert shifted_qkv_gradient is not None
     assert torch.isfinite(shifted_qkv_gradient).all()
+
+
+def test_video_swin_lite_qp_conditioning_changes_nonzero_residual():
+    torch.manual_seed(7)
+    model = VideoSwinLitePreprocessor(
+        patch_size=2,
+        embed_dim=12,
+        depth=2,
+        num_heads=3,
+        window_size=(2, 2, 2),
+        qp_conditioning=True,
+        qp_embed_dim=8,
+    )
+    torch.nn.init.normal_(model.to_rgb.weight, std=0.01)
+    assert model.qp_embedding is not None
+    for parameter in model.qp_embedding.parameters():
+        torch.nn.init.normal_(parameter, std=0.2)
+    for film in model.qp_films:
+        torch.nn.init.normal_(film.weight, std=0.2)
+    clip = 0.25 + 0.5 * torch.rand(1, 3, 3, 8, 8)
+    qp30 = model(clip, qp=30)
+    qp45 = model(clip, qp=45)
+    assert qp30.shape == clip.shape
+    assert qp45.shape == clip.shape
+    assert not torch.allclose(qp30, qp45)
+
+
+def test_video_swin_lite_accepts_per_sample_qp():
+    model = VideoSwinLitePreprocessor(
+        patch_size=2,
+        embed_dim=12,
+        depth=1,
+        num_heads=3,
+        window_size=(2, 2, 2),
+        qp_conditioning=True,
+        qp_embed_dim=8,
+    )
+    clip = torch.rand(2, 2, 3, 8, 8)
+    output = model(clip, qp=torch.tensor([30, 45]))
+    assert output.shape == clip.shape
+    torch.testing.assert_close(output, clip)
 
 
 def test_standard_codec_proxy_preserves_clip_shape_and_has_input_gradient():

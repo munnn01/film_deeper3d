@@ -177,6 +177,9 @@ def main() -> None:
             int(saved_args.get("swin_window_spatial", 8)),
             int(saved_args.get("swin_window_spatial", 8)),
         ),
+        # Checkpoints created before QP conditioning have no FiLM parameters.
+        swin_qp_conditioning=bool(saved_args.get("swin_qp_conditioning", False)),
+        swin_qp_embed_dim=int(saved_args.get("swin_qp_embed_dim", 64)),
         max_residual=float(saved_args.get("max_residual", 0.25)),
     ).to(device).eval()
     preprocessor.load_state_dict(checkpoint["preprocessor"])
@@ -200,10 +203,13 @@ def main() -> None:
 
     for clip, label in tqdm(dataset, desc="real codec evaluation"):
         source = clip.to(device).unsqueeze(0)
-        with torch.no_grad():
-            proposed = preprocessor(source)[0].cpu()
-        for codec in args.codecs:
-            for qp in args.qps:
+        label_tensor = torch.tensor([label], device=device)
+        for qp in args.qps:
+            # A QP-conditioned preprocessor emits a distinct clip for each
+            # operating point. Legacy/CNN/ViT preprocessors simply ignore QP.
+            with torch.no_grad():
+                proposed = preprocessor(source, qp)[0].cpu()
+            for codec in args.codecs:
                 for method, input_clip in (("anchor", clip), ("preprocessed", proposed)):
                     decoded, bpp = real_codec_roundtrip(
                         input_clip,
@@ -214,7 +220,6 @@ def main() -> None:
                         ffmpeg=args.ffmpeg,
                     )
                     decoded_device = decoded.to(device).unsqueeze(0)
-                    label_tensor = torch.tensor([label], device=device)
                     with torch.no_grad():
                         logits = analyzer(decoded_device)
                     key = (codec, qp, method)

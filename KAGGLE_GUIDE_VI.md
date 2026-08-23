@@ -39,6 +39,8 @@ hai script train tự tạo validation split phân tầng trong bộ nhớ.
   --swin-heads 4 \
   --swin-window-temporal 4 \
   --swin-window-spatial 8 \
+  --swin-qp-conditioning \
+  --swin-qp-embed-dim 64 \
   --qp 35 \
   --frames 16 \
   --frame-size 128 \
@@ -120,6 +122,8 @@ với `PROXY_DIR` mới. Cache codec đã tạo trước đây vẫn dùng lại
   --swin-heads 4 \
   --swin-window-temporal 4 \
   --swin-window-spatial 8 \
+  --swin-qp-conditioning \
+  --swin-qp-embed-dim 64 \
   --max-residual 0.25 \
   --codec h264 \
   --codec-qps 30 35 40 45 \
@@ -135,6 +139,11 @@ với `PROXY_DIR` mới. Cache codec đã tạo trước đây vẫn dùng lại
   --amp \
   --output-dir "$MODEL_DIR"
 ```
+
+Video Swin nhận QP đang dùng và FiLM-modulate từng block, đồng thời điều khiển
+cường độ residual theo QP. Vì kiến trúc preprocessor thay đổi, hãy dùng một
+`MODEL_DIR` mới và train từ epoch 1. FiLM deeper-3D proxy cùng cache codec cũ vẫn
+dùng lại được.
 
 ## Cell 7 — Đánh giá codec thật
 
