@@ -22,10 +22,23 @@ from preprocessing import (
     StandardVideoCodec,
     build_preprocessor,
 )
-from preprocessing.codec import compression_loss
 from preprocessing.data import VideoFolderDataset, stratified_split_indices
 from preprocessing.standard_codec import require_ffmpeg
 from preprocessing.utils import AverageMeter, save_checkpoint, seed_everything, topk_correct
+
+
+def compression_loss(
+    source: torch.Tensor,
+    reconstruction: torch.Tensor,
+    bpp: torch.Tensor,
+    alpha: float = 10.0,
+    rate_lambda: float = 0.001,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return the rate-distortion component ``alpha * (L_D + lambda * L_R)``."""
+
+    distortion = F.mse_loss(reconstruction, source)
+    rate = bpp.mean()
+    return alpha * (distortion + rate_lambda * rate), distortion, rate
 
 
 def parse_args() -> argparse.Namespace:

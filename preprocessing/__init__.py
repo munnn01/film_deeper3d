@@ -1,7 +1,6 @@
 """Preprocessing components for compressed video understanding."""
 
 from .analyzer import FrozenVideoAnalyzer
-from .codec import CompressAIVideoCodec
 from .model import PaperPreprocessor, VideoTransformerPreprocessor, build_preprocessor
 from .swin import VideoSwinLitePreprocessor
 from .standard_codec import (
@@ -11,7 +10,6 @@ from .standard_codec import (
 )
 
 __all__ = [
-    "CompressAIVideoCodec",
     "FrozenVideoAnalyzer",
     "PaperPreprocessor",
     "ParallelStandardVideoCodec",

@@ -21,16 +21,6 @@ def normalize_label(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
 
 
-def resolve_split(root: str | Path, split: str | None) -> Path:
-    root_path = Path(root).expanduser()
-    candidate = root_path / split if split else root_path
-    if split and candidate.is_dir():
-        return candidate
-    if root_path.is_dir():
-        return root_path
-    raise FileNotFoundError(f"video directory does not exist: {candidate}")
-
-
 def stratified_split_indices(
     samples: Sequence[tuple[Path, int]], val_ratio: float, seed: int
 ) -> tuple[list[int], list[int]]:
