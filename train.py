@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.optim import Adam
+from torch.optim import Adam, AdamW, Optimizer
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
@@ -39,6 +39,28 @@ def compression_loss(
     distortion = F.mse_loss(reconstruction, source)
     rate = bpp.mean()
     return alpha * (distortion + rate_lambda * rate), distortion, rate
+
+
+def build_qp_lambda_map(
+    codec_qps: list[int], rate_lambdas: list[float]
+) -> dict[int, float]:
+    """Expand a scalar rate lambda or map one value to every codec QP."""
+
+    if not codec_qps:
+        raise ValueError("--codec-qps must contain at least one QP")
+    if len(set(codec_qps)) != len(codec_qps):
+        raise ValueError("--codec-qps must not contain duplicate values")
+    if not rate_lambdas:
+        raise ValueError("--rate-lambda must contain at least one value")
+    if any(value < 0 for value in rate_lambdas):
+        raise ValueError("--rate-lambda values must be non-negative")
+    if len(rate_lambdas) == 1:
+        rate_lambdas = rate_lambdas * len(codec_qps)
+    elif len(rate_lambdas) != len(codec_qps):
+        raise ValueError(
+            "--rate-lambda must be either one value or one value per --codec-qps"
+        )
+    return dict(zip(codec_qps, rate_lambdas, strict=True))
 
 
 def parse_args() -> argparse.Namespace:
@@ -103,7 +125,14 @@ def parse_args() -> argparse.Namespace:
     optimization.add_argument("--accumulation-steps", type=int, default=1)
     optimization.add_argument("--lr", type=float, default=1e-4)
     optimization.add_argument("--alpha", type=float, default=10.0)
-    optimization.add_argument("--rate-lambda", type=float, default=0.001)
+    optimization.add_argument(
+        "--rate-lambda",
+        type=float,
+        nargs="+",
+        default=[0.001],
+        help="one shared value or one value per --codec-qps, in the same order",
+    )
+    optimization.add_argument("--optimizer", choices=("adam", "adamw"), default="adam")
     optimization.add_argument("--weight-decay", type=float, default=0.0)
     optimization.add_argument("--clip-grad", type=float, default=1.0)
     optimization.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
@@ -200,7 +229,11 @@ def forward_losses(
     # precision loss without forcing the expensive codec/analyzer convolutions to FP32.
     with torch.autocast(device_type=device_type, enabled=False):
         rd_loss, distortion, rate = compression_loss(
-            clips.float(), reconstructed.float(), bpp.float(), args.alpha, args.rate_lambda
+            clips.float(),
+            reconstructed.float(),
+            bpp.float(),
+            args.alpha,
+            args.qp_to_rate_lambda[qp],
         )
         accuracy_loss = F.cross_entropy(logits.float(), labels)
         total = rd_loss + accuracy_loss
@@ -221,7 +254,7 @@ def run_epoch(
     args: argparse.Namespace,
     device: torch.device,
     *,
-    optimizer: Adam | None = None,
+    optimizer: Optimizer | None = None,
     scaler: torch.amp.GradScaler | None = None,
     qp_rng: random.Random | None = None,
 ) -> dict[str, float]:
@@ -231,6 +264,11 @@ def run_epoch(
     analyzer.eval()
     meters = {name: AverageMeter() for name in ("loss", "distortion", "bpp", "task_loss")}
     correct1 = correct5 = examples = 0
+    per_qp_meters = {
+        qp: {name: AverageMeter() for name in ("loss", "bpp")}
+        for qp in args.codec_qps
+    }
+    per_qp_correct = {qp: {"top1": 0, "top5": 0, "examples": 0} for qp in args.codec_qps}
     use_amp = bool(args.amp and device.type == "cuda")
     if training:
         optimizer.zero_grad(set_to_none=True)
@@ -242,49 +280,62 @@ def run_epoch(
             if training:
                 if qp_rng is None:
                     raise ValueError("training requires qp_rng")
-                qp = qp_rng.choice(args.codec_qps)
+                batch_qps = [qp_rng.choice(args.codec_qps)]
             else:
-                qp = args.codec_qps[(step - 1) % len(args.codec_qps)]
-            codec.set_qp(qp)
+                # Evaluate every validation clip at every QP. This removes the
+                # clip/QP subsampling noise from checkpoint selection.
+                batch_qps = args.codec_qps
             clips = clips.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
-            losses = forward_losses(
-                clips,
-                labels,
-                preprocessor,
-                codec,
-                analyzer,
-                args,
-                use_amp,
-                qp,
-            )
-            if training:
-                scaled_loss = losses["total"] / args.accumulation_steps
-                assert scaler is not None
-                scaler.scale(scaled_loss).backward()
-                should_step = step % args.accumulation_steps == 0 or step == len(loader)
-                if should_step:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(preprocessor.parameters(), args.clip_grad)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad(set_to_none=True)
+            for qp in batch_qps:
+                codec.set_qp(qp)
+                losses = forward_losses(
+                    clips,
+                    labels,
+                    preprocessor,
+                    codec,
+                    analyzer,
+                    args,
+                    use_amp,
+                    qp,
+                )
+                if training:
+                    scaled_loss = losses["total"] / args.accumulation_steps
+                    assert scaler is not None
+                    scaler.scale(scaled_loss).backward()
+                    should_step = step % args.accumulation_steps == 0 or step == len(loader)
+                    if should_step:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(preprocessor.parameters(), args.clip_grad)
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad(set_to_none=True)
 
-            batch = labels.numel()
-            meters["loss"].update(float(losses["total"].detach()), batch)
-            meters["distortion"].update(float(losses["distortion"].detach()), batch)
-            meters["bpp"].update(float(losses["rate"].detach()), batch)
-            meters["task_loss"].update(float(losses["accuracy_loss"].detach()), batch)
-            correct1 += topk_correct(losses["logits"].detach(), labels, 1)
-            correct5 += topk_correct(losses["logits"].detach(), labels, 5)
-            examples += batch
+                batch = labels.numel()
+                loss_value = float(losses["total"].detach())
+                bpp_value = float(losses["rate"].detach())
+                top1 = topk_correct(losses["logits"].detach(), labels, 1)
+                top5 = topk_correct(losses["logits"].detach(), labels, 5)
+                meters["loss"].update(loss_value, batch)
+                meters["distortion"].update(float(losses["distortion"].detach()), batch)
+                meters["bpp"].update(bpp_value, batch)
+                meters["task_loss"].update(float(losses["accuracy_loss"].detach()), batch)
+                correct1 += top1
+                correct5 += top5
+                examples += batch
+                if not training:
+                    per_qp_meters[qp]["loss"].update(loss_value, batch)
+                    per_qp_meters[qp]["bpp"].update(bpp_value, batch)
+                    per_qp_correct[qp]["top1"] += top1
+                    per_qp_correct[qp]["top5"] += top5
+                    per_qp_correct[qp]["examples"] += batch
             iterator.set_postfix(
                 loss=f"{meters['loss'].average:.4f}",
                 bpp=f"{meters['bpp'].average:.3f}",
-                qp=qp,
+                qp=batch_qps[0] if training else "all",
             )
 
-    return {
+    metrics = {
         "loss": meters["loss"].average,
         "distortion": meters["distortion"].average,
         "bpp": meters["bpp"].average,
@@ -292,6 +343,14 @@ def run_epoch(
         "top1": correct1 / max(examples, 1),
         "top5": correct5 / max(examples, 1),
     }
+    if not training:
+        for qp in args.codec_qps:
+            qp_examples = per_qp_correct[qp]["examples"]
+            metrics[f"qp{qp}_loss"] = per_qp_meters[qp]["loss"].average
+            metrics[f"qp{qp}_bpp"] = per_qp_meters[qp]["bpp"].average
+            metrics[f"qp{qp}_top1"] = per_qp_correct[qp]["top1"] / max(qp_examples, 1)
+            metrics[f"qp{qp}_top5"] = per_qp_correct[qp]["top5"] / max(qp_examples, 1)
+    return metrics
 
 
 def main() -> None:
@@ -308,10 +367,12 @@ def main() -> None:
 
     if not args.codec_qps or any(qp < 0 or qp > 51 for qp in args.codec_qps):
         raise ValueError("--codec-qps must contain values in [0, 51]")
+    args.qp_to_rate_lambda = build_qp_lambda_map(args.codec_qps, args.rate_lambda)
     if args.frame_size % 2:
         raise ValueError("--frame-size must be even for yuv420p H.264/H.265")
     require_ffmpeg(args.ffmpeg)
     print(f"[setup] device={device} autocast={bool(args.amp and device.type == 'cuda')}")
+    print(f"[setup] rate lambdas by QP={args.qp_to_rate_lambda}")
     analyzer = FrozenVideoAnalyzer(args.analyzer).to(device)
     train_loader, val_loader = make_loaders(args, analyzer.categories)
     preprocessor = build_preprocessor(
@@ -376,7 +437,10 @@ def main() -> None:
         ffmpeg=args.ffmpeg,
     )
     codec = ParallelStandardVideoCodec(standard_codec, proxy).to(device)
-    optimizer = Adam(preprocessor.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer_class = AdamW if args.optimizer == "adamw" else Adam
+    optimizer = optimizer_class(
+        preprocessor.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    )
     scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
     use_amp = bool(args.amp and device.type == "cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -395,7 +459,7 @@ def main() -> None:
         qp_rng = random.Random(args.seed + 17 + epoch)
         print(
             f"\n[epoch {epoch}/{args.epochs}] {args.codec.upper()} "
-            f"mixed QPs={args.codec_qps}"
+            f"mixed QPs={args.codec_qps} lambdas={args.qp_to_rate_lambda}"
         )
         train_metrics = run_epoch(
             train_loader,
@@ -421,6 +485,7 @@ def main() -> None:
             "codec": args.codec,
             "codec_qp": args.codec_qps[len(args.codec_qps) // 2],
             "codec_qps": list(args.codec_qps),
+            "rate_lambdas_by_qp": dict(args.qp_to_rate_lambda),
             "proxy_checkpoint": str(args.proxy_checkpoint),
             "args": vars(args),
             "train_metrics": train_metrics,

@@ -19,7 +19,7 @@ DATA = "/kaggle/input/datasets/rohanmallick/kinetics-train-5per/kinetics400_5per
 PROJECT = "/kaggle/working/film_deeper3d"
 PROXY_DIR = "/kaggle/working/checkpoints/h264_film_deeper3d"
 CACHE_DIR = "/kaggle/working/precomputed_codec/h264"
-MODEL_DIR = "/kaggle/working/checkpoints/video_swin_lite"
+MODEL_DIR = "/kaggle/working/checkpoints/video_swin_qp_lambda_k6_2000_400"
 EVAL_DIR = "/kaggle/working/real_codec_eval"
 VIS_DIR = "/kaggle/working/visualization"
 ```
@@ -124,7 +124,7 @@ với `PROXY_DIR` mới. Cache codec đã tạo trước đây vẫn dùng lại
   --swin-window-spatial 8 \
   --swin-qp-conditioning \
   --swin-qp-embed-dim 64 \
-  --max-residual 0.25 \
+  --max-residual 0.10 \
   --codec h264 \
   --codec-qps 30 35 40 45 \
   --codec-fps 30 \
@@ -132,10 +132,18 @@ với `PROXY_DIR` mới. Cache codec đã tạo trước đây vẫn dùng lại
   --frames 16 \
   --frame-stride 2 \
   --frame-size 128 \
-  --epochs 30 \
-  --batch-size 1 \
+  --limit-train 2000 \
+  --limit-val 400 \
+  --epochs 10 \
+  --batch-size 2 \
   --accumulation-steps 4 \
   --workers 4 \
+  --optimizer adamw \
+  --lr 0.0001 \
+  --alpha 10 \
+  --rate-lambda 0.048 0.151 0.386 0.576 \
+  --weight-decay 0.01 \
+  --clip-grad 1.0 \
   --amp \
   --output-dir "$MODEL_DIR"
 ```
@@ -143,7 +151,10 @@ với `PROXY_DIR` mới. Cache codec đã tạo trước đây vẫn dùng lại
 Video Swin nhận QP đang dùng và FiLM-modulate từng block, đồng thời điều khiển
 cường độ residual theo QP. Vì kiến trúc preprocessor thay đổi, hãy dùng một
 `MODEL_DIR` mới và train từ epoch 1. FiLM deeper-3D proxy cùng cache codec cũ vẫn
-dùng lại được.
+dùng lại được. Một giá trị `--rate-lambda` sẽ được dùng chung cho mọi QP; bốn
+giá trị sẽ ánh xạ lần lượt theo thứ tự của `--codec-qps`. Validation chạy toàn bộ
+400 clip ở cả bốn QP để chọn checkpoint ổn định hơn, tương đương 1.600 lượt codec
+thật mỗi epoch.
 
 ## Cell 7 — Đánh giá codec thật
 
